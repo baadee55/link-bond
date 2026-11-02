@@ -1,0 +1,10 @@
+# Eco mode: the total speed (Mbps) allowed for ALL connections to the matching hosts together, while Eco is ON.
+# Video players notice the slower connection and switch to a lower quality by themselves.
+#   2.5 Mbps is about 480p on YouTube; use 1.2 for about 360p. Hosts are best-effort - edit freely.
+# Your own additions go to eco.local.txt (never published).
+*.googlevideo.com = 2.5    # YouTube video
+*.nflxvideo.net = 2.5      # Netflix video
+video*.fbcdn.net = 2.5     # Facebook / Instagram video
+*.tiktokcdn.com = 2.0      # TikTok video
+*.ttvnw.net = 2.5          # Twitch video
+video.twimg.com = 2.0      # X (Twitter) video

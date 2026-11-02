@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>link-bond</title>
+<style>
+  :root { --bg:#f5f7fb; --card:#fff; --ink:#14203a; --muted:#5d6b88; --line:#dde3ef; --ok:#16a34a; --bad:#dc2626; --a:#ea7a14; --b:#0891b2; --c:#7c3aed; --d:#be185d; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#0b1020; --card:#141c33; --ink:#e8edf8; --muted:#97a6c6; --line:#27324f; --ok:#4ade80; --bad:#f87171; --a:#ffa24d; --b:#40e0ff; --c:#a78bfa; --d:#f472b6; } }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.5 "Yu Gothic UI","Segoe UI",system-ui,sans-serif; }
+  main { max-width:980px; margin:0 auto; padding:20px 16px 48px; }
+  h1 { font-size:22px; margin:0 0 2px; } .sub { color:var(--muted); margin:0 0 18px; }
+  .row { display:flex; flex-wrap:wrap; gap:12px; margin-bottom:12px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px 16px; flex:1 1 280px; min-width:0; }
+  .card h2 { font-size:15px; margin:0 0 8px; display:flex; align-items:center; gap:8px; }
+  .dot { width:10px; height:10px; border-radius:50%; background:var(--ok); display:inline-block; flex:none; }
+  .dot.bad { background:var(--bad); }
+  .kv { display:grid; grid-template-columns:auto 1fr; gap:2px 12px; margin:0; font-size:14px; }
+  .kv dt { color:var(--muted); } .kv dd { margin:0; text-align:right; font-variant-numeric:tabular-nums; }
+  .bar { height:8px; border-radius:4px; background:var(--line); overflow:hidden; margin:8px 0 2px; }
+  .bar > i { display:block; height:100%; background:var(--b); }
+  .bar.hot > i { background:var(--bad); }
+  .switch { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:8px 0; border-top:1px solid var(--line); }
+  .switch:first-of-type { border-top:0; }
+  .switch p { margin:0; } .switch small { color:var(--muted); display:block; }
+  button.tg { border:0; border-radius:999px; padding:7px 16px; font:inherit; font-weight:700; cursor:pointer; background:var(--line); color:var(--ink); min-width:74px; }
+  button.tg.on { background:var(--ok); color:#06210f; }
+  canvas { width:100%; height:150px; display:block; }
+  .legend { display:flex; flex-wrap:wrap; gap:4px 14px; font-size:13px; color:var(--muted); margin-top:6px; }
+  .legend i { display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:5px; }
+  .note { color:var(--muted); font-size:13px; margin-top:14px; }
+  .warn { color:var(--bad); font-weight:700; }
+  ul { margin:6px 0 0; padding-left:18px; } li { word-break:break-all; font-size:13px; color:var(--muted); }
+  details { margin-top:10px; border-top:1px solid var(--line); padding-top:8px; }
+  summary { cursor:pointer; color:var(--b); font-weight:700; }
+  .f { display:flex; flex-wrap:wrap; gap:6px; align-items:center; margin:8px 0 0; }
+  .f input { width:92px; padding:6px 8px; border:1px solid var(--line); border-radius:8px; background:var(--bg); color:var(--ink); font:inherit; }
+  .f select, .f button { padding:6px 10px; border:1px solid var(--line); border-radius:8px; background:var(--card); color:var(--ink); font:inherit; }
+  .f button { cursor:pointer; font-weight:700; }
+  .hint { color:var(--muted); font-size:12px; margin:6px 0 0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>link-bond</h1>
+  <p class="sub" id="sub">…</p>
+  <div class="row" id="links"></div>
+  <div class="row">
+    <div class="card" style="flex:2 1 420px">
+      <h2 id="t-graph"></h2>
+      <canvas id="graph" width="900" height="300"></canvas>
+      <div class="legend" id="legend"></div>
+    </div>
+    <div class="card">
+      <h2 id="t-modes"></h2>
+      <div class="switch"><p><b id="pwr-t"></b><small id="pwr-s"></small></p><button class="tg" id="power"></button></div>
+      <div class="switch"><p><b id="eco-t"></b><small id="eco-s"></small></p><button class="tg" id="eco"></button></div>
+      <div class="switch"><p><b id="blk-t"></b><small id="blk-s"></small></p><button class="tg" id="block"></button></div>
+      <div id="blocked"></div>
+    </div>
+  </div>
+  <div class="row">
+    <div class="card">
+      <h2 id="t-dl"></h2>
+      <div class="f"><input id="dl-url" style="width:min(100%,360px)" type="url"><button id="dl-go"></button></div>
+      <p class="hint" id="dl-hint"></p>
+      <div id="dl-list"></div>
+    </div>
+    <div class="card">
+      <h2 id="t-ev"></h2>
+      <ul id="ev-list"></ul>
+    </div>
+  </div>
+  <p class="note" id="note"></p>
+</main>
+<script>
+"use strict";
+const ja = (navigator.language || "ja").toLowerCase().startsWith("ja");
+const T = ja ? {
+  sub: n => `回線 ${n} 本をまとめて使っています`, none:"回線が見つかりません", ok:"正常", cut:"切断", down:"下り", up:"上り", used:"使用", left:"残り",
+  conn:"接続", paused:"一時停止", port:"専用ポート", fc:d => `このペースだと約 ${d} 日で使い切ります`, graph:"通信の速さ（直近5分・link-bond を通った分）",
+  modes:"モード", eco:"低画質モード", ecos:"動画の速さを約2.5 Mbpsに絞る（基本はON）", blk:"広告ブロック", blks:"広告・トラッカーの通信を止める",
+  on:"ON", off:"OFF", blocked:"止めた通信", vpn:"VPN を検知したため、通信は VPN 経由になっています。",
+  note:"「残り」は、あなたが入力した量から、この PC がその端末で使った分を引いた目安です。携帯会社の本当の残高は PC からは読めないので、チャージしたら「+ チャージ」で足してください。",
+  setbal:"残り容量を入力 / チャージ", cur:"今の残り", set:"設定", topup:"チャージ +", add:"追加分", clear:"解除",
+  hint:"携帯会社で確認した「今の残り」を入れると、以降は使った分を引いていきます。", prepaid:"プリペイド残高",
+  unmeasured:"未測定（VPN 中は測りません）",
+  pwr:"PC 全体で使う", pwrs:"OFF にすると元の設定（いつもどおり）に戻ります",
+  dl:"全回線で高速ダウンロード", dlgo:"取得", dlph:"ここに URL を貼る", dlhint:"1 つのファイルを、全部の回線から同時に取ります（Range 対応のサーバー）。保存先: ダウンロード フォルダ",
+  ev:"出来事（新しい順）", noev:"まだ何もありません", cancel:"取消", show:"開く", done:"完了", running:"取得中", err:"失敗"
+} : {
+  sub: n => `${n} connection(s) shared`, none:"No connection found", ok:"OK", cut:"CUT", down:"down", up:"up", used:"used", left:"left",
+  conn:"connections", paused:"paused", port:"own port", fc:d => `runs out in about ${d} days at this pace`, graph:"Speed (last 5 min, through link-bond)",
+  modes:"Modes", eco:"Eco mode", ecos:"Cap video hosts at ~2.5 Mbps (on by default)", blk:"Ad blocking", blks:"Refuse ad / tracker connections",
+  on:"ON", off:"OFF", blocked:"Blocked", vpn:"A VPN is active, so traffic follows the VPN.",
+  note:"'Left' is the amount you typed minus what this PC used over that device. A PC cannot read the carrier's real balance, so press '+ Top up' after you recharge.",
+  setbal:"Enter balance / top up", cur:"Balance now", set:"Set", topup:"Top up +", add:"Added", clear:"Clear",
+  hint:"Type the balance your carrier shows; from then on link-bond subtracts what this PC uses.", prepaid:"Prepaid balance",
+  unmeasured:"not measured (paused while a VPN is on)",
+  pwr:"Use for the whole PC", pwrs:"OFF gives your original settings back",
+  dl:"Fast download over all links", dlgo:"Get", dlph:"paste a URL", dlhint:"Fetches ONE file from all links at once (servers with Range support). Saved to your Downloads folder.",
+  ev:"Events (newest first)", noev:"nothing yet", cancel:"Cancel", show:"Show", done:"done", running:"downloading", err:"failed"
+};
+const COLORS = ["--a", "--b", "--c", "--d"];
+const $ = id => document.getElementById(id);
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; }
+
+function card(l) {
+  const c = el("div", "card"), h = el("h2");
+  h.append(el("span", "dot" + (l.healthy ? "" : " bad")), el("span", "", l.label), el("span", l.healthy ? "" : "warn", l.healthy ? "" : T.cut));
+  c.append(h);
+  const kv = el("dl", "kv");
+  const add = (k, v) => { kv.append(el("dt", "", k), el("dd", "", v)); };
+  add(`${T.down} / ${T.up}`, l.measured ? `${l.down_mbps} / ${l.up_mbps} Mbps` : T.unmeasured);
+  add(T.conn, `${l.active} / ${l.connections}${l.paused ? " · " + T.paused : ""}`);
+  add(T.used, `${l.used_MB.toLocaleString()} MB` + (l.budget_MB ? ` / ${l.budget_MB.toLocaleString()} MB` : ""));
+  if (l.remaining_MB !== null) add(T.left, `${l.remaining_MB.toLocaleString()} MB`);
+  if (l.port) add(T.port, `127.0.0.1:${l.port}`);
+  c.append(kv);
+  if (l.budget_MB) {
+    const pct = Math.min(100, l.used_MB / l.budget_MB * 100), b = el("div", "bar" + (pct >= 95 ? " hot" : "")), i = el("i");
+    i.style.width = pct + "%"; b.append(i); c.append(b);
+  }
+  if (l.forecast_days !== null && l.budget_MB && l.forecast_days < 25) c.append(el("div", "warn", T.fc(Math.round(l.forecast_days))));
+  c.append(balanceForm(l));
+  return c;
+}
+
+async function postBudget(label, body) {
+  try {
+    const r = await fetch("/api/budget", { method: "POST", headers: { "X-LinkBond": "1", "Content-Type": "application/json" }, body: JSON.stringify(Object.assign({ label }, body)) });
+    if (r.ok) { document.activeElement && document.activeElement.blur(); render(await r.json(), true); }
+  } catch (e) {}
+}
+function balanceForm(l) {
+  const d = el("details"); d.append(el("summary", "", T.setbal));
+  const row = (ph, btnText, key) => {
+    const f = el("div", "f"), inp = el("input"), unit = el("select");
+    inp.type = "number"; inp.min = "0"; inp.step = "any"; inp.placeholder = ph; inp.inputMode = "decimal";
+    ["MB", "GB"].forEach(u => { const o = el("option", "", u); o.value = u; unit.append(o); });
+    unit.value = "GB";
+    const b = el("button", "", btnText);
+    b.onclick = () => { const v = parseFloat(inp.value); if (!(v >= 0)) return; postBudget(l.label, { [key]: unit.value === "GB" ? v * 1000 : v }); };
+    f.append(inp, unit, b); return f;
+  };
+  d.append(row(T.cur, T.set, "remaining_MB"), row(T.add, T.topup, "add_MB"));
+  if (l.prepaid) { const f = el("div", "f"), b = el("button", "", T.clear); b.onclick = () => postBudget(l.label, { clear: true }); f.append(b); d.append(f); }
+  d.append(el("p", "hint", T.hint));
+  return d;
+}
+
+function drawGraph(ls) {
+  const cv = $("graph"), g = cv.getContext("2d"), W = cv.width, H = cv.height;
+  g.clearRect(0, 0, W, H);
+  const max = Math.max(2, ...ls.flatMap(l => l.history));
+  g.strokeStyle = css("--line"); g.fillStyle = css("--muted"); g.font = "20px sans-serif"; g.lineWidth = 1;
+  for (let i = 0; i <= 3; i++) { const y = H - 10 - (H - 30) * i / 3; g.beginPath(); g.moveTo(0, y); g.lineTo(W, y); g.stroke(); g.fillText((max * i / 3).toFixed(max < 10 ? 1 : 0) + " Mbps", 4, y - 4); }
+  ls.forEach((l, k) => {
+    g.strokeStyle = css(COLORS[k % 4]); g.lineWidth = 3; g.beginPath();
+    l.history.forEach((v, i) => { const x = W * i / Math.max(l.history.length - 1, 1), y = H - 10 - (H - 30) * v / max; i ? g.lineTo(x, y) : g.moveTo(x, y); });
+    g.stroke();
+  });
+  const lg = $("legend"); lg.textContent = "";
+  ls.forEach((l, k) => { const s = el("span"); const i = el("i"); i.style.background = css(COLORS[k % 4]); s.append(i, l.label); lg.append(s); });
+}
+
+function setBtn(b, on) { b.textContent = on ? T.on : T.off; b.className = "tg" + (on ? " on" : ""); }
+
+let last = null;
+function render(s, force) {
+  last = s;
+  $("sub").textContent = s.links.length ? T.sub(s.links.length) + (s.vpn_on ? " · " + T.vpn : "") : T.none;
+  const box = $("links");
+  // do not rebuild the cards while the user is typing in (or has opened) a balance form
+  const editing = !force && (box.contains(document.activeElement) && document.activeElement.tagName !== "BODY" || box.querySelector("details[open]"));
+  if (!editing) { box.textContent = ""; s.links.forEach(l => box.append(card(l))); }
+  drawGraph(s.links);
+  setBtn($("eco"), s.modes.eco); setBtn($("block"), s.modes.block); setBtn($("power"), s.modes.power);
+  const ev = $("ev-list"); ev.textContent = "";
+  (s.events.length ? s.events : [{ t: "", text: T.noev }]).forEach(e => ev.append(el("li", "", (e.t ? e.t + "  " : "") + e.text.split(" — ")[0])));
+  const dl = $("dl-list"); dl.textContent = "";
+  s.downloads.slice(0, 4).forEach(j => {
+    const box = el("div"); box.style.margin = "8px 0";
+    box.append(el("div", "", j.name));
+    const pct = j.size ? Math.min(100, j.done / j.size * 100) : 0;
+    if (j.state === "running") { const b = el("div", "bar"), i = el("i"); i.style.width = pct + "%"; b.append(i); box.append(b); }
+    const share = Object.entries(j.by_link).map(([k, v]) => `${k} ${v}%`).join(" / ");
+    box.append(el("small", j.state === "error" ? "warn" : "", j.state === "running" ? `${T.running} ${pct.toFixed(0)}%  ${j.mbps} Mbps  ${share}` : j.state === "done" ? `${T.done}  ${j.mbps} Mbps  ${share}` : (j.error || j.state)));
+    if (j.state === "running") { const c = el("button", "tg", T.cancel); c.onclick = () => post("/api/download/cancel", { id: j.id }); box.append(el("div"), c); }
+    if (j.state === "done") { const c = el("button", "tg", T.show); c.onclick = () => post("/api/download/open", { id: j.id }); box.append(el("div"), c); }
+    dl.append(box);
+  });
+  const bl = $("blocked"); bl.textContent = "";
+  if (s.blocked.total) { bl.append(el("small", "", `${T.blocked}: ${s.blocked.total}`)); const u = el("ul"); s.blocked.top.forEach(([h, n]) => u.append(el("li", "", `${h} × ${n}`))); bl.append(u); }
+}
+
+async function poll() { try { const r = await fetch("/status.json", { cache: "no-store" }); render(await r.json()); } catch (e) { $("sub").textContent = "link-bond に接続できません / cannot reach link-bond"; } }
+async function setMode(k) {
+  if (!last) return;
+  try { const r = await fetch("/api/mode", { method: "POST", headers: { "X-LinkBond": "1", "Content-Type": "application/json" }, body: JSON.stringify({ [k]: !last.modes[k] }) }); render(await r.json()); } catch (e) {}
+}
+async function post(path, body) {
+  try { const r = await fetch(path, { method: "POST", headers: { "X-LinkBond": "1", "Content-Type": "application/json" }, body: JSON.stringify(body) }); if (r.ok) render(await r.json(), true); else alert(await r.text()); } catch (e) {}
+}
+$("eco").onclick = () => setMode("eco"); $("block").onclick = () => setMode("block"); $("power").onclick = () => setMode("power");
+$("dl-go").onclick = () => { const u = $("dl-url").value.trim(); if (u) { post("/api/download", { url: u }); $("dl-url").value = ""; } };
+$("dl-url").onkeydown = e => { if (e.key === "Enter") $("dl-go").click(); };
+$("t-dl").textContent = T.dl; $("dl-go").textContent = T.dlgo; $("dl-url").placeholder = T.dlph; $("dl-hint").textContent = T.dlhint; $("t-ev").textContent = T.ev;
+$("pwr-t").textContent = T.pwr; $("pwr-s").textContent = T.pwrs;
+$("t-graph").textContent = T.graph; $("t-modes").textContent = T.modes;
+$("eco-t").textContent = T.eco; $("eco-s").textContent = T.ecos; $("blk-t").textContent = T.blk; $("blk-s").textContent = T.blks; $("note").textContent = T.note;
+poll(); setInterval(poll, 2000);
+</script>
+</body>
+</html>

@@ -1,0 +1,32 @@
+name: release
+# When a release is published, build link-bond.exe and attach a ready-to-use zip to that release.
+# (The release itself always has the plain source zip from GitHub; this adds the .exe build.)
+on:
+  release:
+    types: [published]
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python selftest.py
+      - run: pip install pyinstaller==6.10.0
+      - run: pyinstaller --onefile --name link-bond bond.py
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory package | Out-Null
+          Copy-Item dist/link-bond.exe, dashboard.html, widget.pyw, LICENSE, README.md, README.ja.md, CHANGELOG.md package/
+          Copy-Item *.ps1, *.bat, *.txt package/
+          Copy-Item -Recurse browser-extension, docs package/
+          Compress-Archive -Path package/* -DestinationPath link-bond-windows-exe.zip
+      - name: Attach to the release
+        shell: pwsh
+        run: gh release upload "${{ github.event.release.tag_name }}" link-bond-windows-exe.zip --clobber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,9 @@
+{
+  "manifest_version": 3,
+  "name": "link-bond downloads",
+  "version": "1.0.0",
+  "description": "Every download is fetched by link-bond over ALL your connections at once. If link-bond is not running or cannot fetch a file, the browser downloads it as usual.",
+  "permissions": ["downloads", "cookies"],
+  "host_permissions": ["<all_urls>"],
+  "background": { "service_worker": "background.js" }
+}

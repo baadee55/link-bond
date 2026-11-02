@@ -1,0 +1,15 @@
+# Hosts listed here always leave over the SAME link (the fastest one), so a login session
+# keeps one public IP address. Everything else is spread across all links.
+#   example.com   = example.com and all its sub-domains
+#   ~bank         = every host whose name contains "bank"
+# Put your own private additions in pinned.local.txt (it is never published).
+accounts.google.com
+google.com
+facebook.com
+paypal.com
+amazon.com
+apple.com
+microsoft.com
+live.com
+github.com
+~bank

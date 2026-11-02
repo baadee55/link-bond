@@ -1,0 +1,41 @@
+# Ad / tracker domains refused while "ad blocking" is ON (dashboard switch). A domain also covers its sub-domains.
+# Only well-known advertising networks - no sites you log in to. Best effort; some pages may look different.
+# Your own additions: blocklist.local.txt.  A leading "-" lets a domain through again:  -example.com
+doubleclick.net
+googlesyndication.com
+googleadservices.com
+googletagservices.com
+adservice.google.com
+adnxs.com
+adsrvr.org
+criteo.com
+criteo.net
+taboola.com
+outbrain.com
+pubmatic.com
+rubiconproject.com
+openx.net
+casalemedia.com
+33across.com
+amazon-adsystem.com
+moatads.com
+scorecardresearch.com
+quantserve.com
+bluekai.com
+krxd.net
+demdex.net
+everesttech.net
+adform.net
+smartadserver.com
+advertising.com
+yieldmo.com
+teads.tv
+sharethrough.com
+media.net
+mgid.com
+revcontent.com
+zedo.com
+adcolony.com
+applovin.com
+ads-twitter.com
+ads.yahoo.com
