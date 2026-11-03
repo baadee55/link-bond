@@ -24,6 +24,7 @@ HERE = os.path.dirname(sys.executable if getattr(sys, "frozen", False) else os.p
 BASE = os.environ.get("LINKBOND_URL", "http://127.0.0.1:1081")  # the env variable is for tests only
 LOCK_PORT = 1082
 PREFS = os.path.join(HERE, "widget.json")
+BEAT = os.path.join(HERE, "widget.beat")  # touched every few seconds: the supervisor restarts a box that is gone
 EXT_DIR = os.path.join(HERE, "browser-extension")
 
 JA = ctypes.windll.kernel32.GetUserDefaultUILanguage() & 0xFF == 0x11 if sys.platform == "win32" else False
@@ -37,6 +38,8 @@ TX = {
     "cut": ("切断", "cut"), "left": ("残り", "left"), "used": ("使用", "used"), "unm": ("未測定", "not measured"),
     "cap": ("実力", "can do"), "rtt": ("応答", "ping"), "loss": ("取りこぼし", "loss"), "ago": ("{}秒前", "{}s ago"),
     "checking": ("確認中…", "checking…"), "measuring": ("⚡ 測定中…", "⚡ measuring…"),
+    "suspect": ("確認中（応答なし）", "checking (no answer)"), "drops": ("今日 {}回切断・{}%", "{} drops today · {}%"),
+    "dlwait": ("⏸ 回線が戻るのを待っています", "⏸ waiting for a link to come back"),
     "measure": ("⚡ 速さを測る（1回線 約3MB）", "⚡ Measure speed (~3 MB per link)"), "measure_s": ("⚡ 測る", "⚡ Test"),
     "eco_s": ("低画質", "Low-res video"), "block_s": ("広告ブロック", "No ads"),
     "stalled": ("テザリング停止中 → スマホで OFF→ON", "tethering stopped → switch it off and on"),
@@ -44,7 +47,11 @@ TX = {
     "vpnboth": ("🔒 VPN（他のアプリ用）と束ねを両立中", "🔒 VPN (other apps) + bonding"),
     "vpnhow": ("両立させる方法", "How to use both"),
     "sup": ("⚠ 自動復旧が動いていません（デスクトップのアイコンから起動してください）", "⚠ safety net is not running (start from the desktop icon)"),
-    "newver": ("🆕 新しい版 {} があります", "🆕 version {} is available"), "get": ("入手", "Get"),
+    "newver": ("🆕 新しい版 {} があります", "🆕 version {} is available"), "get": ("更新する", "Update"),
+    "upnow": ("⏳ {} を入れています…", "⏳ installing {}…"),
+    "updone": ("✓ {} を入れました。まもなく切り替わります", "✓ {} installed - switching in a moment"),
+    "upfail": ("⚠ {} の自動更新に失敗（30 分後にまた試します）。「ページ」から手で入れられます", "⚠ update to {} failed (retrying in 30 min) - or get it from the page"),
+    "page": ("ページ", "Page"),
     "updated": ("🆕 {} に更新しました", "🆕 updated to {}"), "changes": ("変更点", "What's new"),
     "graph": ("通信の様子（直近5分・全回線）", "Traffic (last 5 min, all links)"),
     "tab_graph": ("グラフ", "Graph"), "tab_dl": ("ダウンロード", "Download"), "tab_bal": ("残り容量", "Balance"),
@@ -56,7 +63,7 @@ TX = {
     "bal": ("残り容量（プリペイド）", "Balance (prepaid)"), "setbal": ("今の残りに設定", "Set balance"),
     "topup": ("チャージ +", "Top up +"),
     "events": ("出来事（新しい順）", "Events (newest first)"), "noevents": ("まだ何もありません", "nothing yet"),
-    "open": ("詳しい画面", "Dashboard"), "help": ("回線を増やす", "Add a link"), "quit": ("完全に終了", "Quit all"),
+    "open": ("詳しい画面", "Dashboard"), "hist": ("接続の記録", "Connection record"), "help": ("回線を増やす", "Add a link"), "quit": ("完全に終了", "Quit all"),
     "small": ("小さく", "Smaller"), "big": ("詳しく", "More"), "less": ("たたむ", "Less"),
     "alpha": ("透明度", "Opacity"), "top": ("常に手前に表示", "Always on top"), "fade": ("使わないときは薄くする", "Fade when idle"),
     "confirm": ("link-bond を完全に終了して、元の設定に戻します。よろしいですか？",
@@ -207,6 +214,8 @@ def link_status(l):
         return "✖ " + t("cut"), "bad"
     if l.get("measuring"):
         return t("measuring"), "muted"
+    if l.get("suspect"):
+        return "? " + t("suspect"), "slow"
     if l.get("rtt_ms") is None:
         return t("checking"), "muted"
     q = l.get("quality", "good")
@@ -222,7 +231,10 @@ def link_detail(l):
     """What the link can do and the data: '実力 ↓39 ↑9 Mbps · 使用 5.4 GB'."""
     cap = f"{t('cap')} ↓{l['down_mbps']:.0f} ↑{l['up_mbps']:.0f}" if l.get("measured") else f"{t('cap')} {t('unm')}"
     data = f"{t('left')} {fmt_mb(l['remaining_MB'])}" if l.get("remaining_MB") is not None else f"{t('used')} {fmt_mb(l['used_MB'])}"
-    return f"{cap}  ·  {data}"
+    out = f"{cap}  ·  {data}"
+    if l.get("drops_today"):  # how unstable it was today: drops and % of the day it worked
+        out += "  ·  " + t("drops").format(l["drops_today"], l.get("uptime_today", 100))
+    return out
 
 
 def event_lines(events, n=4):
@@ -239,15 +251,19 @@ def api(path, body=None, timeout=3):
         return json.loads(r.read().decode())
 
 
-def open_dashboard():
+def open_history():
+    open_dashboard("/history")
+
+
+def open_dashboard(page="/"):
     prof = os.path.join(HERE, "ui-profile")
     for b in (os.path.expandvars(r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe"),
               os.path.expandvars(r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe"),
               os.path.expandvars(r"%ProgramFiles%\Google\Chrome\Application\chrome.exe")):
         if os.path.exists(b):
-            subprocess.Popen([b, f"--app={BASE}/", f"--user-data-dir={prof}", "--no-first-run", "--window-size=1000,900"])
+            subprocess.Popen([b, f"--app={BASE}{page}", f"--user-data-dir={prof}", "--no-first-run", "--window-size=1000,900"])
             return
-    os.startfile(BASE + "/")
+    os.startfile(BASE + page)
 
 
 # ---------- look ----------
@@ -286,7 +302,8 @@ class Switch(tk.Canvas):
 
 
 class Widget:
-    def __init__(self):
+    def __init__(self, lock=None):
+        self.lock = lock
         self.prefs = {"x": None, "y": None, "mode": "normal", "alpha": 0.94, "idle_alpha": 0.6, "fade": True, "top": True}
         try:
             with open(PREFS, encoding="utf-8-sig") as f:  # -sig: also reads a file saved with a BOM
@@ -373,7 +390,7 @@ class Widget:
         self.warn = tk.Label(self.warnrow, text=t("sup"), bg=BG, fg=BAD, font=(FONT, 8), wraplength=int(300 * self.S), justify="left")
         self.uprow = tk.Frame(self.body, bg=BG)
         self.uprow.pack(fill="x")
-        self.uplab = tk.Label(self.uprow, text="", bg=BG, fg=ACC, font=(FONT, 9, "bold"))
+        self.uplab = tk.Label(self.uprow, text="", bg=BG, fg=ACC, font=(FONT, 9, "bold"), wraplength=int(220 * self.S), justify="left")
         self.upbtn = self.button(self.uprow, t("get"), self.open_update, small=True)
         self.newsrow = tk.Frame(self.body, bg=BG)
         self.newsrow.pack(fill="x")
@@ -445,6 +462,7 @@ class Widget:
         self.foot = foot = tk.Frame(self.full, bg=BG)
         foot.pack(fill="x", pady=(8, 0), side="bottom")
         self.button(foot, t("open"), open_dashboard, small=True).pack(side="left")
+        self.button(foot, t("hist"), open_history, small=True).pack(side="left", padx=(6, 0))
         self.button(foot, t("help"), lambda: messagebox.showinfo("link-bond", HELP, parent=self.root), small=True).pack(side="left", padx=6)
         self.button(foot, t("quit"), self.quit_all, small=True, fg=BAD).pack(side="right")
 
@@ -544,8 +562,20 @@ class Widget:
             x, y = self.root.winfo_screenwidth() - w - 24, 60
         elif not first:
             x, y = self.root.winfo_x(), self.root.winfo_y()
+        x, y = self.clamp(x, y, w, h)
         self.root.geometry(f"{w}x{h}+{x}+{y}")
         self.render()
+
+    def clamp(self, x, y, w, h):
+        """Keep the whole box (with its title bar and border) inside the work area of the monitor it is on:
+        a pill at the right edge that grows must not run off the screen or under the taskbar."""
+        r = self.root
+        fw = max(0, r.winfo_rootx() - r.winfo_x()) * 2          # left + right border
+        fh = max(0, r.winfo_rooty() - r.winfo_y()) + fw // 2    # title bar + top border + bottom border
+        left, top, right, bottom = work_area(x, y) or (0, 0, r.winfo_screenwidth(), r.winfo_screenheight() - 48)
+        x = max(left, min(x, right - (w + fw)))
+        y = max(top, min(y, bottom - (h + fh)))
+        return x, y
 
     def on_screen(self, x, y):
         return x is not None and -50 < x < self.root.winfo_screenwidth() - 50 and -10 < y < self.root.winfo_screenheight() - 50
@@ -580,6 +610,7 @@ class Widget:
         m.add_checkbutton(label=t("fade"), variable=fade, command=lambda: self.pref("fade", fade.get()))
         m.add_separator()
         m.add_command(label=t("open"), command=open_dashboard)
+        m.add_command(label=t("hist"), command=open_history)
         m.add_command(label=t("quit"), command=self.quit_all)
         m.tk_popup(e.x_root, e.y_root)
 
@@ -596,8 +627,10 @@ class Widget:
         self.save()
 
     def close(self):
+        """✕ only hides the box; link-bond keeps working. The desktop icon (回線まとめ) shows it again."""
+        self.prefs["hidden"] = True
         self.save()
-        self.root.destroy()
+        self.root.withdraw()
 
     # ----- talking -----
     def poll(self):
@@ -660,9 +693,24 @@ class Widget:
         self.post("/api/mode", {"news_seen": True})
 
     def open_update(self):
-        url = ((self.state or {}).get("update") or {}).get("url")
-        if url:
-            os.startfile(url)
+        """Install the new version right here when link-bond can (it then restarts, and so does this box);
+        otherwise (the .exe, a failed download) open the release page."""
+        up = (self.state or {}).get("update") or {}
+        if up.get("auto") and up.get("state") != "failed" and up.get("tested"):
+            self.uplab.config(text=t("upnow").format(up.get("version", "")))
+
+            def run():
+                try:
+                    r = api("/api/update", {}, timeout=300)
+                except Exception as e:
+                    r = {"installed": False, "url": up.get("url"), "error": str(e)[:120]}
+                if not r.get("installed") and r.get("url") and r.get("state") == "failed":
+                    os.startfile(r["url"])  # it could not be installed here: the page, to get it by hand
+                if r.get("error"):  # shown on the update row itself (the message line sits in another tab)
+                    self.root.after(0, lambda: self.uplab.config(text="⚠ " + str(r["error"])[:90]))
+            threading.Thread(target=run, daemon=True).start()
+        elif up.get("url"):
+            os.startfile(up["url"])
 
     def show_vpn_help(self):
         path = (self.state or {}).get("bypass_exe") or "linkbond.exe"
@@ -676,15 +724,27 @@ class Widget:
     def quit_all(self):
         if messagebox.askyesno("link-bond", t("confirm"), parent=self.root):
             try:
-                api("/api/quit", {})
-            except Exception:
-                pass
-            self.root.destroy()
+                api("/api/quit", {})  # stop.ps1 ends link-bond, its supervisor and this box together
+            except Exception:  # link-bond is not answering: run stop.ps1 ourselves
+                stop = os.path.join(HERE, "stop.ps1")
+                if os.path.exists(stop):
+                    subprocess.Popen(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", stop],
+                                     creationflags=0x08000000)
+            self.root.withdraw()
+            self.root.after(15000, self.root.destroy)  # in case nothing ended this box
 
     # ----- drawing -----
     def tick(self):
         self.render()
         self.check_new_version()
+        now = time.time()
+        if self.lock is not None and now - getattr(self, "_beat", 0) >= 5:
+            self._beat = now
+            try:
+                with open(BEAT, "w") as f:
+                    f.write(str(int(now)))
+            except OSError:
+                pass
         self.root.after(1000, self.tick)
 
     def check_new_version(self):
@@ -739,9 +799,12 @@ class Widget:
         self.show(self.vpnbtn, vp and not both, side="right", pady=(8, 0))
         self.show(self.warn, not s["supervised"], anchor="w", pady=(8, 0))
         up = s.get("update") or {}
-        self.uplab.config(text=t("newver").format(up.get("version", "")))
+        ust = up.get("state")
+        key = {"installing": "upnow", "installed": "updone", "failed": "upfail"}.get(ust, "newver")
+        self.uplab.config(text=t(key).format(up.get("version", "")))
+        self.upbtn.config(text=t("get") if up.get("auto") and ust != "failed" and up.get("tested") else t("page"))
         self.show(self.uplab, bool(up.get("version")), side="left", pady=(8, 0))
-        self.show(self.upbtn, bool(up.get("version")), side="right", pady=(8, 0))
+        self.show(self.upbtn, bool(up.get("version")) and ust not in ("installing", "installed"), side="right", pady=(8, 0))
         n = s.get("news") or {}
         self.newslab.config(text=t("updated").format(n.get("to", "")))
         self.show(self.newslab, bool(n.get("to")), side="left", pady=(8, 0))
@@ -837,7 +900,7 @@ class Widget:
             share = " / ".join(f"{k} {v}%" for k, v in j["by_link"].items())
             if j["state"] == "running":
                 ttk.Progressbar(fr, maximum=100, value=pct, style="LB.Horizontal.TProgressbar").pack(fill="x", pady=(3, 0))
-                info = f"{pct:.0f}%  ·  {j['mbps']} Mbps  ·  {share}"
+                info = t("dlwait") + f"  ·  {pct:.0f}%" if j.get("waiting") else f"{pct:.0f}%  ·  {j['mbps']} Mbps  ·  {share}"
             elif j["state"] == "done":
                 info = f"{t('done')}  {fmt_mb((j['size'] or j['done']) / 1e6)}  ·  {j['mbps']} Mbps  ·  {share}"
             else:
@@ -851,29 +914,37 @@ class Widget:
         self.fit()
 
     def fit(self):
-        """Exactly as big as what it shows - and moved up if it would run off the bottom of the screen."""
+        """Exactly as big as what it shows - and moved back if it would run off the screen."""
         r = self.root
         r.update_idletasks()
         w, h = r.winfo_reqwidth(), r.winfo_reqheight()
-        x, y = r.winfo_x(), r.winfo_y()
-        y = max(0, min(y, r.winfo_screenheight() - h - 70))
+        x, y = self.clamp(r.winfo_x(), r.winfo_y(), w, h)
         r.geometry(f"{w}x{h}+{x}+{y}")
 
     # ----- single instance: a 2nd start just brings the first one forward -----
     def lock_server(self):
+        """Another start of the box (desktop icon) sends b"raise": bring this one forward. Anything else is ignored."""
+        if self.lock is None:
+            return
         try:
-            srv = socket.socket()
-            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
-            srv.bind(("127.0.0.1", LOCK_PORT))
-            srv.listen(2)
             while True:
-                c, _ = srv.accept()
-                c.close()
-                self.root.after(0, self.raise_up)
+                c, _ = self.lock.accept()
+                try:
+                    c.settimeout(2)
+                    want = c.recv(16) == b"raise"
+                except OSError:
+                    want = False
+                finally:
+                    c.close()
+                if want:
+                    self.root.after(0, self.raise_up)
         except OSError:
             pass
 
     def raise_up(self):
+        if self.prefs.get("hidden"):
+            self.prefs["hidden"] = False
+            self.save()
         self.root.deiconify()
         self.root.lift()
         if self.prefs["mode"] == "pill":
@@ -882,12 +953,56 @@ class Widget:
         self.root.attributes("-topmost", bool(self.prefs["top"]))
 
 
-def already_running():
+class _RECT(ctypes.Structure):
+    _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long), ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+
+class _MONITORINFO(ctypes.Structure):
+    _fields_ = [("cbSize", ctypes.c_ulong), ("rcMonitor", _RECT), ("rcWork", _RECT), ("dwFlags", ctypes.c_ulong)]
+
+
+class _POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
+def work_area(x, y):
+    """(left, top, right, bottom) of the usable part (no taskbar) of the monitor at x, y; None if unknown."""
     try:
-        socket.create_connection(("127.0.0.1", LOCK_PORT), timeout=0.5).close()
-        return True
+        u = ctypes.windll.user32
+        u.MonitorFromPoint.restype = ctypes.c_void_p
+        mon = u.MonitorFromPoint(_POINT(int(x), int(y)), 2)  # 2 = the nearest monitor
+        mi = _MONITORINFO()
+        mi.cbSize = ctypes.sizeof(_MONITORINFO)
+        if mon and u.GetMonitorInfoW(ctypes.c_void_p(mon), ctypes.byref(mi)):
+            w = mi.rcWork
+            return w.left, w.top, w.right, w.bottom
+    except Exception:
+        pass
+    return None
+
+
+def take_lock():
+    """The single-instance lock: a listening socket on LOCK_PORT, or None when another box holds it."""
+    srv = socket.socket()
+    try:
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+    except (AttributeError, OSError):
+        pass
+    try:
+        srv.bind(("127.0.0.1", LOCK_PORT))
+        srv.listen(4)
+        return srv
     except OSError:
-        return False
+        srv.close()
+        return None
+
+
+def ask_first_to_raise():
+    try:
+        with socket.create_connection(("127.0.0.1", LOCK_PORT), timeout=1) as c:
+            c.sendall(b"raise")
+    except OSError:
+        pass
 
 
 if __name__ == "__main__":
@@ -898,14 +1013,23 @@ if __name__ == "__main__":
     argv = sys.argv[1:]
     opt = lambda name: argv[argv.index(name) + 1] if name in argv and argv.index(name) + 1 < len(argv) else None
     shot, force_mode = opt("--shot"), opt("--mode")  # developer options: --shot out.png [--mode pill|normal|full]
-    if "--replace" in argv:  # started by an older version that is closing: wait until it is gone
-        for _ in range(40):
-            if not already_running():
+    lock = None
+    if not shot:
+        tries = 40 if "--replace" in argv else 1  # started by an older version that is closing: wait for it
+        for _ in range(tries):
+            lock = take_lock()
+            if lock:
                 break
             time.sleep(0.25)
-    if already_running() and not shot:
-        sys.exit(0)
-    app = Widget()
+        if lock is None:  # a box is already open: bring it forward and leave
+            if "--background" not in argv:  # the supervisor only makes sure one runs: it never pops it up
+                ask_first_to_raise()
+            sys.exit(0)
+    app = Widget(lock)
+    if app.prefs.get("hidden") and ("--replace" in argv or "--background" in argv):
+        app.root.withdraw()  # it was hidden with x: an update or a restart by the supervisor keeps it hidden
+    elif app.prefs.get("hidden"):
+        app.prefs["hidden"] = False  # started by you (desktop icon / logon): show it
     if shot:  # photograph only our own window (it is DPI-aware, so the size is exact), then leave without saving
         app.save = lambda: None
         app.prefs.update(x=60, y=60, alpha=1.0, idle_alpha=1.0, fade=False)

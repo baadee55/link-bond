@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>接続の記録 - link-bond</title>
+<style>
+  :root { --bg:#0b1222; --card:#141d33; --line:#22304f; --fg:#e5edf8; --mut:#8b9bb8; --acc:#22d3ee;
+          --ok:#34d399; --slow:#fbbf24; --doubt:#fb923c; --bad:#f87171; --cut:#dc2626; --none:#2a3550; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.5 "Segoe UI","Yu Gothic UI",Meiryo,sans-serif; }
+  main { max-width:1100px; margin:0 auto; padding:18px 16px 40px; }
+  h1 { font-size:20px; margin:0 0 4px; } h2 { font-size:15px; margin:0; }
+  .sub { color:var(--mut); font-size:12px; }
+  .days { display:flex; flex-wrap:wrap; gap:6px; margin:14px 0 16px; }
+  .days button { background:var(--card); color:var(--fg); border:1px solid var(--line); border-radius:8px; padding:5px 10px; cursor:pointer; font:inherit; }
+  .days button.on { border-color:var(--acc); color:var(--acc); }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px 14px 12px; margin-bottom:12px; }
+  .head { display:flex; justify-content:space-between; align-items:baseline; gap:12px; flex-wrap:wrap; margin-bottom:8px; }
+  .stat { font-size:13px; } .stat b { font-size:16px; } .stat.bad b { color:var(--bad); } .stat.ok b { color:var(--ok); }
+  .bar { position:relative; height:26px; background:var(--none); border-radius:6px; overflow:hidden; }
+  .bar span { position:absolute; top:0; bottom:0; }
+  .ticks { position:relative; height:16px; font-size:10px; color:var(--mut); }
+  .ticks span { position:absolute; transform:translateX(-50%); }
+  svg { display:block; width:100%; height:70px; margin-top:6px; }
+  .legend { display:flex; flex-wrap:wrap; gap:12px; font-size:12px; color:var(--mut); margin:4px 0 14px; }
+  .legend i { display:inline-block; width:12px; height:12px; border-radius:3px; vertical-align:-2px; margin-right:4px; }
+  .pages { margin-top:8px; font-size:12px; color:var(--slow); word-break:break-all; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  td { padding:5px 6px; border-top:1px solid var(--line); vertical-align:top; }
+  td.t { color:var(--mut); white-space:nowrap; width:1%; }
+  tr.cut td:last-child { color:var(--bad); } tr.back td:last-child { color:var(--ok); }
+  .empty { color:var(--mut); padding:20px 0; }
+  a { color:var(--acc); }
+</style>
+</head>
+<body>
+<main>
+  <h1>接続の記録</h1>
+  <div class="sub">回線ごとに、1 日のうちいつつながっていて、いつ切れていたか。<span id="upd"></span> ・ <a href="/">詳しい画面へ</a></div>
+  <div class="days" id="days"></div>
+  <div class="legend">
+    <span><i style="background:var(--ok)"></i>正常</span><span><i style="background:var(--slow)"></i>遅い</span>
+    <span><i style="background:var(--doubt)"></i>確認中（応答なし）</span><span><i style="background:var(--bad)"></i>とても悪い</span>
+    <span><i style="background:var(--cut)"></i>切断</span><span><i style="background:var(--none)"></i>つながっていない・記録なし</span>
+  </div>
+  <div id="devs"></div>
+  <div class="card" id="nolinkCard" style="display:none">
+    <div class="head"><h2>使える回線が 1 本もなかった時間</h2><div class="stat bad"><b id="nolinkMin">0</b> 分</div></div>
+    <div class="bar" id="nolinkBar"></div><div class="ticks" id="nolinkTicks"></div>
+  </div>
+  <div class="card">
+    <div class="head"><h2>出来事</h2><span class="sub">新しい順</span></div>
+    <table id="events"></table>
+  </div>
+</main>
+<script>
+const COLORS = {ok:"var(--ok)", slow:"var(--slow)", doubt:"var(--doubt)", bad:"var(--bad)", cut:"var(--cut)"};
+let day = null;
+
+function esc(s) { return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+
+function runs(states) {          // minute -> state  =>  [start, end, state] for each run of equal states
+  const ms = Object.keys(states).map(Number).sort((a, b) => a - b), out = [];
+  for (const m of ms) {
+    const s = states[m], last = out[out.length - 1];
+    if (last && last[2] === s && last[1] >= m - 1) last[1] = m; else out.push([m, m, s]);
+  }
+  return out;
+}
+
+function bar(el, states) {
+  el.innerHTML = runs(states).map(([a, b, s]) =>
+    `<span title="${hm(a)}〜${hm(b + 1)} ${label(s)}" style="left:${a / 14.4}%;width:${Math.max((b - a + 1) / 14.4, 0.08)}%;background:${COLORS[s] || "var(--cut)"}"></span>`).join("");
+}
+function ticks(el) { el.innerHTML = [0, 3, 6, 9, 12, 15, 18, 21, 24].map(h => `<span style="left:${h / 24 * 100}%">${h}時</span>`).join(""); }
+function hm(m) { return String(Math.floor(m / 60)).padStart(2, "0") + ":" + String(m % 60).padStart(2, "0"); }
+function label(s) { return {ok:"正常", slow:"遅い", doubt:"確認中", bad:"とても悪い", cut:"切断"}[s] || s; }
+
+function rttChart(rtt) {
+  const pts = Object.entries(rtt).map(([m, v]) => [Number(m), v]).sort((a, b) => a[0] - b[0]);
+  if (!pts.length) return "";
+  const top = Math.max(500, ...pts.map(p => p[1]));
+  const line = pts.map(([m, v]) => `${(m / 1440 * 1000).toFixed(1)},${(66 - v / top * 60).toFixed(1)}`).join(" ");
+  return `<svg viewBox="0 0 1000 70" preserveAspectRatio="none">
+    <line x1="0" x2="1000" y1="${66 - 250 / top * 60}" y2="${66 - 250 / top * 60}" stroke="#fbbf24" stroke-dasharray="4 4" stroke-width="1" opacity=".5"/>
+    <polyline points="${line}" fill="none" stroke="#22d3ee" stroke-width="1.5" vector-effect="non-scaling-stroke"/>
+    <text x="4" y="12" fill="#8b9bb8" font-size="11">応答時間（上が遅い・最大 ${top}ms・点線 250ms）</text></svg>`;
+}
+
+async function load(d) {
+  const r = await fetch("/api/history" + (d ? "?day=" + encodeURIComponent(d) : ""));
+  const data = await r.json();
+  day = data.day;
+  document.getElementById("upd").textContent = data.day + " の記録";
+  document.getElementById("days").innerHTML = (data.days.length ? data.days : [data.day]).map(x =>
+    `<button class="${x === data.day ? "on" : ""}" data-day="${esc(x)}">${esc(x.slice(5).replace("-", "/"))}</button>`).join("");
+  document.querySelectorAll("#days button").forEach(b => b.addEventListener("click", () => load(b.dataset.day)));
+  const devs = document.getElementById("devs");
+  if (!data.devices.length) devs.innerHTML = `<div class="card empty">この日の記録はまだありません。</div>`;
+  else devs.innerHTML = data.devices.map((d, i) => `
+    <div class="card">
+      <div class="head"><h2>${esc(d.name)}</h2>
+        <div><span class="stat ${d.drops ? "bad" : "ok"}">切断 <b>${d.drops}</b> 回</span> ・
+             <span class="stat ${d.up_pct !== null && d.up_pct < 95 ? "bad" : "ok"}">つながっていた <b>${d.up_pct ?? "-"}</b>%</span>
+             <span class="sub">（記録 ${Math.round(d.minutes / 6) / 10} 時間）</span></div></div>
+      <div class="bar" id="bar${i}"></div><div class="ticks" id="t${i}"></div>
+      ${rttChart(d.rtt)}
+      ${Object.keys(d.pages).length ? `<div class="pages">ネットの代わりに返ってきたページ（データ切れ・ログイン画面など）：<br>${
+        Object.entries(d.pages).map(([p, t]) => `${esc(t)} → ${esc(p)}`).join("<br>")}</div>` : ""}
+    </div>`).join("");
+  data.devices.forEach((d, i) => { bar(document.getElementById("bar" + i), d.states); ticks(document.getElementById("t" + i)); });
+  const nl = document.getElementById("nolinkCard");
+  if (data.nolink.length) {
+    nl.style.display = "";
+    document.getElementById("nolinkMin").textContent = data.nolink.length;
+    const st = {}; data.nolink.forEach(m => st[m] = "cut");
+    bar(document.getElementById("nolinkBar"), st); ticks(document.getElementById("nolinkTicks"));
+  } else nl.style.display = "none";
+  document.getElementById("events").innerHTML = data.events.slice().reverse().map(e => {
+    const cls = /切断|切れ|外れ/.test(e.text) ? "cut" : /復旧|戻り|つながりました/.test(e.text) ? "back" : "";
+    return `<tr class="${cls}"><td class="t">${esc(e.t)}</td><td>${esc(e.text.split(" — ")[0])}</td></tr>`;
+  }).join("") || `<tr><td class="empty">まだありません</td></tr>`;
+}
+load(null);
+function today() { const n = new Date(); return n.getFullYear() + "-" + String(n.getMonth() + 1).padStart(2, "0") + "-" + String(n.getDate()).padStart(2, "0"); }
+setInterval(() => { if (day === today() || day === null) load(day); }, 30000);
+</script>
+</body>
+</html>

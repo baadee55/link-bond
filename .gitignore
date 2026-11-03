@@ -31,3 +31,13 @@ last-update.json
 keep-connected.log
 fix-simultaneous.log
 *.log
+connlog/
+update-backup/
+update-pending.json
+update-rolled-back.txt
+widget.beat
+*.new
+wifi.json
+update-skip.txt
+supervisor.log
+stability.json

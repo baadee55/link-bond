@@ -116,6 +116,9 @@ def unit():
     check("vpn detect: a VPN adapter that is not preferred = VPN off",
           not bond.classify([dict(nord, metric=100), usb, wifi])[1])
     check("vpn detect: OpenVPN-style /1 routes = VPN on", bond.classify([usb, wifi], slash1=True)[1])
+    check("links: a Wi-Fi that dropped (Windows keeps its route for a while) is not a link",
+          sorted(bond.classify([usb, dict(wifi, status="Disconnected")])[0]) == [48]
+          and not bond.classify([dict(nord, status="Disconnected"), usb, wifi])[1])
     many = [dict(usb, idx=100 + i, name=f"Phone {i}", ip=f"10.1.{i}.2", metric=25 + i) for i in range(6)]
     check("many links: six phones are all found", len(bond.classify(many)[0]) == 6)
     check("classify: the gateway is reported", bond.classify([dict(usb, gw="10.0.0.1")])[0][48][3] == "10.0.0.1")
@@ -210,6 +213,273 @@ def unit():
     # updates: the version is read from the file, compared as numbers, and announced once with what changed
     check("version: read from a bond.py file", bond.file_version(bond.__file__) == bond.__version__)
     check("version: compared as numbers", bond.vtuple("1.10.0") > bond.vtuple("1.9.3") and bond.vtuple("v1.4") == (1, 4))
+
+    # self-update: a published release is downloaded and put in place by itself (only the program files)
+    import io as _io
+    import zipfile as _zip
+    check("update: the web module is loaded (1.5.0 failed every check on this)", hasattr(bond.urllib, "request"))
+
+    def release_zip(version="9.9.9", bond_src=None, extra=None):
+        b = _io.BytesIO()
+        with _zip.ZipFile(b, "w") as z:
+            top = "baadee55-link-bond-abc123/"
+            z.writestr(top, "")
+            z.writestr(top + "bond.py", bond_src if bond_src is not None else f'__version__ = "{version}"\nx = 1\n')
+            z.writestr(top + "widget.pyw", "y = 2\n")
+            z.writestr(top + "eco.txt", "new eco\n")
+            z.writestr(top + "browser-extension/background.js", "// new\n")
+            z.writestr(top + ".github/workflows/ci.yml", "evil: 1\n")
+            z.writestr(top + "usage.json", "{}")
+            z.writestr(top + "eco.local.txt", "mine\n")
+            z.writestr(top + "docs/../../evil.py", "boom\n")
+            for k, v in (extra or {}).items():
+                z.writestr(top + k, v)
+        return b.getvalue()
+
+    m = bond.update_members(["r-1/bond.py", "r-1/.github/workflows/ci.yml", "r-1/usage.json", "r-1/eco.local.txt",
+                             "r-1/docs/../../x.py", "r-1/browser-extension/a.js", "r-1/browser-extension/x/y.js",
+                             "r-1/", "bond.py", "r-1/C:/x.py"])
+    check("update: only program files are taken (no settings, no CI files, no paths that climb out)",
+          sorted(m.values()) == ["bond.py", "browser-extension/a.js"])
+    upd = tempfile.mkdtemp(prefix="linkbond-upd-")
+    for name, text in (("bond.py", '__version__ = "1.0.0"\n'), ("eco.txt", "old eco\n"), ("usage.json", '{"keep": 1}'),
+                       ("eco.local.txt", "my own\n")):
+        with open(os.path.join(upd, name), "w", encoding="utf-8") as f:
+            f.write(text)
+    written = bond.apply_update(release_zip(), "9.9.9", here=upd)
+    rd = lambda *p: open(os.path.join(upd, *p), encoding="utf-8").read()
+    check("update: the new files are put in place, bond.py last (it makes link-bond restart)",
+          written[-1] == "bond.py" and '"9.9.9"' in rd("bond.py") and rd("eco.txt") == "new eco\n"
+          and rd("browser-extension", "background.js") == "// new\n")
+    check("update: your settings and own lists are not touched",
+          rd("usage.json") == '{"keep": 1}' and rd("eco.local.txt") == "my own\n"
+          and not os.path.exists(os.path.join(upd, ".github")) and not os.path.exists(os.path.join(upd, "evil.py")))
+    check("update: the old files are kept in update-backup", rd("update-backup", "bond.py") == '__version__ = "1.0.0"\n')
+
+    def refused(blob, version="9.9.9"):
+        before = rd("bond.py")
+        try:
+            bond.apply_update(blob, version, here=upd)
+            return False
+        except ValueError:
+            return rd("bond.py") == before
+    check("update: a download of another version is refused (nothing written)", refused(release_zip("9.9.8")))
+    check("update: a broken bond.py is refused (nothing written)", refused(release_zip(bond_src='__version__ = "9.9.9"\ndef (:\n')))
+    check("update: something that is not a zip is refused", refused(b"<html>not found</html>"))
+    check("update: a zip without link-bond in it is refused", refused(_zip_bytes := b"PK\x05\x06" + b"\x00" * 18))
+    check("update: a developer's git copy is never overwritten",
+          bond.update_blocker() == ("git" if os.path.isdir(os.path.join(bond.HERE, ".git")) else ""))
+
+    class _Resp(_io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    class _Opener:
+        def open(self, req, timeout=0):
+            return _Resp(json.dumps({"tag_name": "v9.9.9", "html_url": "https://example.com/r",
+                                     "zipball_url": "https://example.com/z",
+                                     "assets": [{"name": "link-bond-windows-exe.zip"}] if tested else []}).encode())
+    real_build = bond.urllib.request.build_opener
+    bond.urllib.request.build_opener = lambda *a: _Opener()
+    try:
+        tested = True
+        rel = bond.check_release()
+        tested = False
+        rel2 = bond.check_release()
+    finally:
+        bond.urllib.request.build_opener = real_build
+    check("update: the newest release is read from GitHub (version, page, zip, tests passed)",
+          rel == ("9.9.9", "https://example.com/r", "https://example.com/z", True) and rel2[3] is False)
+    check("update: Windows device names in a release are not written",
+          bond.update_members(["r/docs/NUL", "r/docs/con.md", "r/docs/a.", "r/docs/ok.md"]) == {"r/docs/ok.md": "docs/ok.md"})
+    # one install at a time, and never the same one twice
+    saved = dict(bond.update_info)
+    bond.update_info.clear()
+    bond.update_info.update(version="9.9.9", zip="https://example.com/z", state="installed")
+    check("update: an install that is done is not repeated", bond.install_update() is True)
+    bond._install_lock.acquire()
+    bond.update_info["state"] = None
+    check("update: a second install while one runs is refused", bond.install_update() is False)
+    bond._install_lock.release()
+    bond.update_info.clear()
+    bond.update_info.update(saved)
+    check("update: a marker is left so that a new version that keeps failing can be rolled back",
+          os.path.exists(os.path.join(upd, "update-pending.json")))
+
+    # Wi-Fi rejoin: only the network that was a link, a few seconds after it dropped, then every 30 s
+    bond.wifi_last.clear()
+    bond.adapter_desc.clear()
+    bond.net_profile.clear()
+    bond.adapter_desc.update({"Wi-Fi": "Intel Wi-Fi"})
+    bond.net_profile.update({"Wi-Fi": "my iPhone"})
+    t0 = 1000.0
+    check("wifi: a connected Wi-Fi link is remembered", bond.wifi_plan([("Intel Wi-Fi", 1)], {"Wi-Fi"}, t0) == []
+          and bond.wifi_last["Intel Wi-Fi"]["profile"] == "my iPhone")
+    first = bond.wifi_plan([("Intel Wi-Fi", 4)], {"Wi-Fi"}, t0 + 1)
+    again = bond.wifi_plan([("Intel Wi-Fi", 4)], {"Wi-Fi"}, t0 + 7)
+    soon = bond.wifi_plan([("Intel Wi-Fi", 4)], {"Wi-Fi"}, t0 + 20)
+    later = bond.wifi_plan([("Intel Wi-Fi", 4)], {"Wi-Fi"}, t0 + 40)
+    check("wifi: a dropped Wi-Fi link is joined again (after 5 s, then every 30 s)",
+          first == [] and again == [("Intel Wi-Fi", "my iPhone")] and soon == [] and later == again)
+    bond.net_profile["Wi-Fi"] = "Cafe"
+    bond.wifi_plan([("Intel Wi-Fi", 1)], set(), t0 + 50)
+    check("wifi: when you join another network, it is left alone",
+          "Intel Wi-Fi" not in bond.wifi_last and bond.wifi_plan([("Intel Wi-Fi", 4)], set(), t0 + 99) == [])
+    check("wifi: Windows' Wi-Fi state can be read without location permission", isinstance(bond.wlan_call(), list))
+
+    # DNS replies: only the answer to OUR question counts (id, name), CNAME chains and compressed names are read
+    qid, pkt = bond.dns_packet("www.Example.com")
+    q = pkt[12:]
+    cname = b"\x03cdn\xc0\x10"  # cdn.example.com, compressed (example.com sits at offset 16)
+    ans = (b"\xc0\x0c" + struct.pack("!HHIH", 5, 1, 300, len(cname)) + cname
+           + b"\xc0\x2d" + struct.pack("!HHIH", 1, 1, 60, 4) + socket.inet_aton("1.2.3.4"))
+    reply = struct.pack("!HHHHHH", qid, 0x8180, 1, 2, 0, 0) + q + ans
+    check("dns: a reply with a CNAME chain and compressed names is read", bond.dns_answer(reply, qid, "www.example.com") == (["1.2.3.4"], 60))
+    check("dns: a reply with another id is ignored", bond.dns_answer(reply, qid ^ 1, "www.example.com") is None)
+    check("dns: a reply about another name is ignored", bond.dns_answer(reply, qid, "evil.example.com") is None)
+    tc = struct.pack("!HHHHHH", qid, 0x8380, 1, 2, 0, 0) + q + ans
+    check("dns: a truncated reply is left to Windows", bond.dns_answer(tc, qid, "www.example.com") is None)
+    check("dns: garbage does not crash", bond.dns_answer(b"\x00" * 40, qid, "www.example.com") is None
+          and bond.dns_answer(reply[:30], qid, "www.example.com") is None)
+
+    # notices on a flapping link: a blip is recorded, not notified; a real cut is notified once, then "back"
+    told = []
+    real_notify, real_wait = bond.notify, bond.NOTIFY_DOWN_AFTER
+    bond.notify = lambda title, text: told.append(title)
+    fl = bond.new_link(77, "flappy", "10.9.9.9")
+    bond.links[77] = fl
+
+    async def flaps():
+        bond.NOTIFY_DOWN_AFTER = 0.2
+        for _ in range(5):  # five blips, each over before NOTIFY_DOWN_AFTER
+            fl["fails"] = bond.FAILS_TO_DOWN - 1
+            bond.tell(fl, bond.apply_probe(fl, False, "no-response"))
+            await asyncio.sleep(0.05)
+            bond.tell(fl, bond.apply_probe(fl, True, ""))
+            await asyncio.sleep(0.3)
+        blips = [t for t in told if "不安定" not in t]
+        fl["fails"] = bond.FAILS_TO_DOWN - 1
+        bond.tell(fl, bond.apply_probe(fl, False, "no-response"))  # a cut that lasts
+        await asyncio.sleep(0.4)
+        w_probe = bond.weight(fl)
+        bond.tell(fl, bond.apply_probe(fl, True, ""))
+        return blips, w_probe
+    try:
+        blips, _ = asyncio.run(flaps())
+    finally:
+        bond.notify, bond.NOTIFY_DOWN_AFTER = real_notify, real_wait
+        bond.links.pop(77, None)
+    check(f"notices: five short blips are recorded but not notified ({len(blips)} notices)", len(blips) == 0)
+    cut_back = [t for t in told if "不安定" not in t]
+    check(f"notices: a cut that lasts is notified once, and its end too ({cut_back})", len(cut_back) == 2)
+    check("notices: a link that keeps dropping is called unstable once", len([t for t in told if "不安定" in t]) == 1)
+    d, up = bond.stability_today(fl)
+    check(f"stability: today's drops are counted ({d})", d == 6)
+    w_back = bond.weight(fl)
+    fl["probation_until"] = 0
+    check("stability: a link that just came back gets a smaller share", w_back < bond.weight(fl))
+    bond.wifi_last.clear()
+    bond.save_wifi("Intel Wi-Fi", "my iPhone")
+    bond.load_wifi()
+    check("wifi: the network to rejoin is remembered across a restart",
+          bond.wifi_last.get("Intel Wi-Fi", {}).get("profile") == "my iPhone")
+    with open(os.path.join(bond.STATE_DIR, "update-skip.txt"), "w", encoding="utf-8") as f:
+        f.write("9.9.9")
+    check("update: a version that was rolled back is remembered (not installed again)", bond.skipped_version() == "9.9.9")
+    os.remove(os.path.join(bond.STATE_DIR, "update-skip.txt"))
+    # the roll-back marker is removed only by the version it is about
+    with open(os.path.join(upd, "update-pending.json"), "w", encoding="utf-8") as f:
+        json.dump({"to": "9.9.9"}, f)
+    check("update: an older process does not confirm a newer version's install", not bond.confirm_pending(upd)
+          and os.path.exists(os.path.join(upd, "update-pending.json")))
+    with open(os.path.join(upd, "update-pending.json"), "w", encoding="utf-8") as f:
+        json.dump({"to": bond.__version__}, f)
+    check("update: the running version confirms its own install", bond.confirm_pending(upd)
+          and not os.path.exists(os.path.join(upd, "update-pending.json")))
+    # a failed write puts everything back; unchanged files are not rewritten
+    upd2 = tempfile.mkdtemp(prefix="linkbond-upd2-")
+    for name, text in (("bond.py", '__version__ = "1.0.0"\n'), ("eco.txt", "new eco\n"), ("widget.pyw", "old\n")):
+        with open(os.path.join(upd2, name), "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+    real_replace = bond.os.replace
+    calls = []
+
+    def flaky_replace(a, b):
+        calls.append(b)
+        if b.endswith("bond.py"):
+            raise PermissionError("held")
+        return real_replace(a, b)
+    bond.os.replace = flaky_replace
+    real_sleep, bond.time.sleep = bond.time.sleep, lambda x: None
+    try:
+        try:
+            bond.apply_update(release_zip(), "9.9.9", here=upd2)
+            failed_ok = False
+        except PermissionError:
+            failed_ok = True
+    finally:
+        bond.os.replace, bond.time.sleep = real_replace, real_sleep
+    rd2 = lambda n: open(os.path.join(upd2, n), encoding="utf-8").read()
+    check("update: a write that fails puts the old files back (no mix of versions, no marker left)",
+          failed_ok and rd2("widget.pyw") == "old\n" and '"1.0.0"' in rd2("bond.py")
+          and not os.path.exists(os.path.join(upd2, "update-pending.json"))
+          and not os.path.exists(os.path.join(upd2, "browser-extension", "background.js")))
+    check("update: a file that did not change is not rewritten", not any(c.endswith("eco.txt") for c in calls))
+    check("capacity: a damaged saved value does not stop link-bond", not bond.sane_capacity({"down": None, "up": 1})
+          and not bond.sane_capacity({"down": "9", "up": 1}) and bond.sane_capacity({"down": 20.5, "up": 6.1, "at": 1.0}))
+    here = os.path.dirname(os.path.abspath(__file__))
+    bad = [n for n in os.listdir(here) if n.endswith(".ps1") and any(b > 127 for b in open(os.path.join(here, n), "rb").read())]
+    check("scripts: every .ps1 is plain ASCII (Windows PowerShell 5.1 misreads anything else)", not bad)
+    bond.add_event("test event")
+    day = time.strftime("%Y-%m-%d")
+    rec = [json.loads(x) for x in open(os.path.join(bond.STATE_DIR, "connlog", day + ".jsonl"), encoding="utf-8")]
+    # the history page: minute-by-minute state per device, drops, % up, the page that answered instead
+    hd = os.path.join(bond.STATE_DIR, "connlog")
+    with open(os.path.join(hd, "2026-01-02.jsonl"), "w", encoding="utf-8") as f:
+        for i, (ok, q, page) in enumerate([(True, "good", ""), (True, "good", ""), (False, "bad", "302 http://top-up.example/"),
+                                            (False, "bad", ""), (True, "slow", ""), (True, "good", "")]):
+            f.write(json.dumps({"t": f"2026-01-02 10:0{i}:00", "kind": "link", "link": "Phone A", "ok": ok,
+                                "quality": q, "rtt_ms": 100 + i, "page": page}) + "\n")
+        f.write(json.dumps({"t": "2026-01-02 10:02:30", "kind": "event", "text": "Phone A: 切断 / cut"}) + "\n")
+        f.write(json.dumps({"t": "2026-01-02 10:03:30", "kind": "none"}) + "\n")
+    h = bond.history_data("2026-01-02")
+    dev = h["devices"][0] if h and h["devices"] else {}
+    check("history: a day is read per device and minute (drops, % up, the answering page, events)",
+          dev.get("drops") == 1 and dev.get("up_pct") == 67 and dev.get("states", {}).get("602") == "cut"
+          and "302 http://top-up.example/" in dev.get("pages", {}) and len(h["events"]) == 1 and h["nolink"] == [603])
+    check("history: a bad day name is refused", bond.history_data("../../secret") is None)
+    # automatic repair: which adapter to restart, and when not
+    saved_links = dict(bond.links)
+    bond.links.clear()
+    bond.repair_last.clear()
+    bond.stalled_since.clear()
+    bond.adapter_idx.clear()
+    now = time.time()
+    dead = bond.new_link(41, "Ethernet 9", "10.7.0.2")
+    dead.update(healthy=False, why="no-response", down_since=now - 120)
+    paid = bond.new_link(42, "Ethernet 8", "10.8.0.2")
+    paid.update(healthy=False, why="redirect", down_since=now - 600)  # an "out of data" page: a restart cannot help
+    fresh = bond.new_link(43, "Ethernet 7", "10.9.0.2")
+    fresh.update(healthy=False, why="no-response", down_since=now - 20)  # cut 20 s ago: wait a bit first
+    bond.links.update({41: dead, 42: paid, 43: fresh})
+    bond.adapter_idx["Ethernet 6"] = 44
+    bond.stalled_since["Ethernet 6"] = now - 90  # plugged in, no address for 90 s
+    plan = bond.repair_plan(now)
+    check("repair: a cut adapter (no answer, 90 s+) and one stuck without an address are restarted",
+          sorted(i for i, _, _ in plan) == [41, 44])
+    for i, _, _ in plan:
+        bond.repair_last[i] = now
+    check("repair: not again within 10 minutes", bond.repair_plan(now + 60) == [])
+    check("repair: an 'out of data' page is not a reason to restart", all(i != 42 for i, _, _ in bond.repair_plan(now + 700)))
+    bond.links.clear()
+    bond.links.update(saved_links)
+    bond.stalled_since.clear()
+    bond.repair_last.clear()
+    check("record: events and log lines go to the connection record (connlog/day.jsonl)",
+          any(r["kind"] == "event" and r["text"] == "test event" for r in rec) and any(r["kind"] == "log" for r in rec))
     check("changelog: what changed in this version is found", len(bond.changelog_head(bond.__version__)) > 5)
     vf = os.path.join(bond.STATE_DIR, "version.txt")
     if os.path.exists(vf):
@@ -256,6 +526,11 @@ def unit():
     bond.capacity.clear()
     bond.load_capacity()
     check("capacity: kept on disk across a restart", bond.cap_key(c) in bond.capacity)
+    bond.capacity["bad|10.9.9.9"] = {"down": 17145.5, "up": 17145.5, "at": 1.0}  # saved by the old counting error
+    bond.save_capacity()
+    bond.load_capacity()
+    check("capacity: an impossible saved speed is thrown away on load", "bad|10.9.9.9" not in bond.capacity
+          and bond.cap_key(c) in bond.capacity)
     check("speed tests: no periodic tests by default (they cost data)", bond.REMEASURE_SEC == 0)
 
     # problems: everything that is wrong, in one list (the widget turns red on any of them)
@@ -446,6 +721,22 @@ def unit():
     check("speeds: the part that went through link-bond is shown too", good["via_down"] == 24.0)
     check("speeds: the total of all links, down and up", bond.total_down[-1] == 120.0 and bond.total_up[-1] == 10.0)
     check("speeds: real throughput above the speed test raises the link's speed", good["down"] == 100.0 and good["up"] == 10.0)
+    # a reconnected adapter counts from 0 again: that is not 4 GB of traffic (it once showed 17 000 Mbps)
+    before = (good["down"], good["up"])
+    counters[11] = [3_000_000, 1_000, 433_000_000]  # counter reset; the adapter says it runs at 433 Mbps
+    bond.sample_history(2)
+    check("speeds: an adapter whose counters start again from 0 is not read as a huge speed",
+          good["now_down"] < 100 and good["now_up"] < 100 and good["down"] <= before[0] + 0.01 and good["up"] <= before[1] + 0.01)
+    counters[11] = [3_000_000 + 50_000_000, 1_000, 433_000_000]
+    bond.sample_history(2)
+    check("speeds: after the reset it counts normally again", good["now_down"] == 200.0)
+    counters[11] = [3_600_000_000, 2_000, 0, True]  # 64-bit counters (GetIfEntry2), 3.6 GB so far
+    bond.sample_history(2)
+    counters[11] = [5_000, 100, 0, True]            # the phone reconnected: counters start again
+    before64 = good["down"]
+    bond.sample_history(2)
+    check("speeds: a 64-bit counter that goes down is a reset, never a wrap (no 3000 Mbps ghost)",
+          good["now_down"] < 100 and good["down"] <= before64 + 0.01)
     bond.read_octets = lambda idx: None  # no adapter counters (e.g. not Windows): fall back to what link-bond carried
     bond._prev_octets.clear()
     good["b_down"] += 2_500_000
@@ -563,8 +854,202 @@ async def e2e():
     code, got = await socks_echo(pport, eport, b"failover")
     took = asyncio.get_running_loop().time() - t0
     check("failover: the dead link is skipped and the connection still succeeds quickly",
-          code == 0 and got == b"failover" and took < 3 and bad["paused_until"] > time.time() and bad["conn_fails"] >= 1)
+          code == 0 and got == b"failover" and took < 3 and bad["conn_fails"] >= 1)
     del bond.links[9]
+
+    # ---------- built for unstable links: measured with faults injected on purpose ----------
+    loop_ = asyncio.get_running_loop()
+    good = bond.links[1]
+    real_connect = bond.link_connect
+
+    async def connect_hole(l, sk, addr):  # a link that never answers (SYN into a black hole)
+        if l["name"] == "hole":
+            await asyncio.sleep(60)
+        await real_connect(l, sk, addr)
+    bond.link_connect = connect_hole
+    hole = bond.new_link(1, "hole", "127.0.0.1")
+    hole.update(down=100.0, up=50.0, rtt=150)  # looks like the best link, and answers checks in 150 ms
+    bond.links[8] = hole
+    t0 = loop_.time()
+    code, got = await socks_echo(pport, eport, b"hole")
+    took = loop_.time() - t0
+    check(f"unstable: a link that never answers costs well under a second, not 4 s ({took:.2f} s)",
+          code == 0 and got == b"hole" and took < 1.0)
+    hole["suspect"] = False
+    hole["conn_fails"] = 0
+
+    # the slower attempt that lost the race is not a failure of its link
+    async def connect_slow(l, sk, addr):
+        if l["name"] == "hole":
+            await asyncio.sleep(0.6)
+        await real_connect(l, sk, addr)
+    bond.link_connect = connect_slow
+    hole["rtt"] = 100  # the 2nd link starts after 0.25 s and wins; the 1st is cancelled
+    code, got = await socks_echo(pport, eport, b"race")
+    check("unstable: the attempt that lost the race does not count against its link",
+          code == 0 and not hole["suspect"] and hole["conn_fails"] == 0)
+    bond.link_connect = real_connect
+    del bond.links[8]
+
+    # all links cut for a moment: a new connection waits for one to come back instead of failing at once
+    good["healthy"] = False
+    good["data_at"] = 0  # no traffic arriving on it (that alone would prove it works)
+
+    async def back_soon():
+        await asyncio.sleep(1.5)
+        good["healthy"] = True
+        bond.link_back.set()
+    real_c = bond.link_connect
+
+    async def connect_when_back(l, sk, addr):
+        if not good["healthy"]:
+            raise OSError("network is unreachable")
+        await real_c(l, sk, addr)
+    bond.link_connect = connect_when_back
+    asyncio.ensure_future(back_soon())
+    t0 = loop_.time()
+    code, got = await socks_echo(pport, eport, b"held")
+    took = loop_.time() - t0
+    bond.link_connect = real_c
+    good["suspect"] = False
+    check(f"unstable: with every link cut for 1.5 s, the connection waits and succeeds ({took:.1f} s)",
+          code == 0 and got == b"held" and 1.0 < took < 6)
+
+    # prepaid data used up: DNS still answers, the web does not -> the link must be cut (it once stayed "fine" 18 min)
+    dataless = bond.new_link(7, "dataless", "127.0.0.1")
+    real_ping, real_probe = bond.ping, bond.probe
+
+    async def ping_ok(l):
+        return True, 120
+
+    async def probe_dead(l):
+        return (False, "redirect") if l["name"] == "dataless" else await real_probe(l)
+    bond.ping, bond.probe = ping_ok, probe_dead
+    real_fast = bond.FAST_SEC
+    bond.FAST_SEC = 0.05
+    bond.links[7] = dataless
+    try:
+        ok, why = await bond.check_link(dataless, time.time())
+        check("data cut: a link whose DNS answers but whose web does not fails its check", not ok and why == "redirect")
+        bond.suspect(dataless, "check")
+        for _ in range(60):
+            if not dataless["healthy"]:
+                break
+            await asyncio.sleep(0.05)
+        check("data cut: such a link is cut within seconds, not left 'fine'", not dataless["healthy"])
+        ok2, _ = await bond.check_link(dataless, time.time(), quick=True)
+        check("data cut: a DNS answer alone does not bring it back while the web is dead", not ok2)
+    finally:
+        bond.ping, bond.probe, bond.FAST_SEC = real_ping, real_probe, real_fast
+        bond.links.pop(7, None)
+
+    # one host that never answers (a tracker blocked by the network) does not make a good link suspect
+    th_link = bond.new_link(1, "two-hosts", "127.0.0.1")
+    bond.links[6] = th_link
+
+    async def connect_slowhost(l, sk, addr):
+        await asyncio.sleep(60)
+    real_c2 = bond.link_connect
+    bond.link_connect = connect_slowhost
+    real_hold = bond.HOLD_SEC
+    bond.HOLD_SEC = 0
+    try:
+        try:
+            await bond.race_connect([th_link], "1.2.3.4", 443, "tracker.example")
+        except Exception:
+            pass
+    finally:
+        bond.link_connect, bond.HOLD_SEC = real_c2, real_hold
+    one_host = th_link["suspect"]
+    bond.links.pop(6, None)
+    check("connect: a single host timing out does not make a working link suspect", not one_host)
+
+    # a server that refuses is not a link problem: no waiting, no suspicion
+    dead_port = free_port()
+    t0 = loop_.time()
+    code, _ = await socks_echo(pport, dead_port, b"x")
+    took = loop_.time() - t0
+    check(f"unstable: a server that refuses fails at once and does not make the link suspect ({took:.2f} s)",
+          code != 0 and took < 3.5 and not good["suspect"])  # Windows itself takes ~2 s to report a refused local port
+
+    # every adapter gone (the commonest total outage): a new connection waits for one to appear
+    saved = dict(bond.links)
+    bond.links.clear()
+
+    async def appears():
+        await asyncio.sleep(1.0)
+        bond.links.update(saved)
+        bond.wake_waiters()
+    asyncio.ensure_future(appears())
+    t0 = loop_.time()
+    code, got = await socks_echo(pport, eport, b"appeared")
+    took = loop_.time() - t0
+    check(f"unstable: with no link at all, a new connection waits for one to appear ({took:.1f} s)",
+          code == 0 and got == b"appeared" and 0.8 < took < 6)
+
+    # names: Windows' resolver hangs (its phone is cut) -> answered over a working link; nothing answers -> last known
+    real_sys, real_over = bond._system_lookup, bond.dns_over
+
+    async def sys_hangs(name, port):
+        await asyncio.sleep(30)
+
+    async def over_ok(link, name, server, timeout=2.0):
+        return (["8.8.8.8"], 120)
+    bond._system_lookup, bond.dns_over = sys_hangs, over_ok
+    bond.dns_cache.clear()
+    t0 = loop_.time()
+    ip = await bond.resolve("www.example-unstable.com")
+    took = loop_.time() - t0
+    check(f"names: Windows' resolver hangs -> answered over a working link ({took:.2f} s)", ip == "8.8.8.8" and took < 1)
+
+    async def over_dead(link, name, server, timeout=2.0):
+        return None
+    bond.dns_over = over_dead
+    bond.dns_cache["www.example-unstable.com"][1] = time.time() - 1  # expired, but known
+    real_as = bond.asyncio.as_completed
+
+    def quick_as_completed(fs, timeout=None):
+        return real_as(fs, timeout=0.5)
+    bond.asyncio.as_completed = quick_as_completed
+    try:
+        ip2 = await bond.resolve("www.example-unstable.com")
+    finally:
+        bond.asyncio.as_completed = real_as
+    check("names: when nothing answers, the last known address is used", ip2 == "8.8.8.8")
+    bond._system_lookup, bond.dns_over = real_sys, real_over
+    check("names: an address is used as it is", await bond.resolve("10.1.2.3") == "10.1.2.3")
+    bond.dns_cache.clear()
+
+    async def sys_portal(name, port):
+        return (["10.10.10.10"], 300, "sys")  # an operator's "out of data" page answers every name
+
+    async def over_public(link, name, server, timeout=2.0):
+        await asyncio.sleep(0.1)
+        return (["1.2.3.4"], 300)
+    bond._system_lookup, bond.dns_over = sys_portal, over_public
+    ip3 = await bond.resolve("news.example-unstable.com")
+    check("names: a private address for a public name loses to the real one from another link", ip3 == "1.2.3.4")
+
+    async def over_portal(link, name, server, timeout=2.0):
+        return (["192.168.0.1"], 3600)
+    bond.dns_over = over_portal
+    bond.dns_cache.clear()
+    check("names: a private answer from the public DNS over a link is never used",
+          await bond._link_lookup(bond.links[1], "x.example-unstable.com", "8.8.8.8") is None)
+    calls = []
+
+    async def sys_counted(name, port):
+        calls.append(name)
+        await asyncio.sleep(0.2)
+        return (["8.8.8.8"], 300, "sys")
+
+    async def over_none(link, name, server, timeout=2.0):
+        return None
+    bond._system_lookup, bond.dns_over = sys_counted, over_none
+    got_many = await asyncio.gather(*(bond.resolve("same.example-unstable.com") for _ in range(20)))
+    check(f"names: 20 connections to one new name cause one lookup ({len(calls)})",
+          len(calls) == 1 and set(got_many) == {"8.8.8.8"})
+    bond._system_lookup, bond.dns_over = real_sys, real_over
 
     # VPN takes over -> open tunnels on a physical link are closed so apps reconnect through the VPN
     r, w = await asyncio.open_connection("127.0.0.1", pport)

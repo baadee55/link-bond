@@ -44,6 +44,7 @@
 <body>
 <main>
   <h1>link-bond</h1>
+  <p class="sub"><a href="/history" style="color:#22d3ee">接続の記録（いつ・どの回線が切れたか） / connection record</a></p>
   <p class="sub" id="sub">…</p>
   <div class="row" id="links"></div>
   <div class="row">
@@ -92,7 +93,7 @@ const T = ja ? {
 } : {
   sub: n => `${n} connection(s) shared`, none:"No connection found", ok:"OK", cut:"CUT", down:"down", up:"up", used:"used", left:"left",
   conn:"connections", paused:"paused", port:"own port", fc:d => `runs out in about ${d} days at this pace`, graph:"Speed (last 5 min, through link-bond)",
-  modes:"Modes", eco:"Eco mode", ecos:"Cap video hosts at ~2.5 Mbps (on by default)", blk:"Ad blocking", blks:"Refuse ad / tracker connections",
+  modes:"Modes", eco:"Low-quality video", ecos:"Cap video hosts at ~2.5 Mbps (on by default)", blk:"Ad blocking", blks:"Refuse ad / tracker connections",
   on:"ON", off:"OFF", blocked:"Blocked", vpn:"A VPN is active, so traffic follows the VPN.",
   note:"'Left' is the amount you typed minus what this PC used over that device. A PC cannot read the carrier's real balance, so press '+ Top up' after you recharge.",
   setbal:"Enter balance / top up", cur:"Balance now", set:"Set", topup:"Top up +", add:"Added", clear:"Clear",

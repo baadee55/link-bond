@@ -11,22 +11,28 @@ Windows 10/11, Python 3.9+, standard library only.
 import argparse
 import asyncio
 import collections
+import concurrent.futures
 import ctypes
 import fnmatch
+import io
 import ipaddress
 import json
 import os
 import re
+import shutil
 import socket
 import ssl
 import struct
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
+import urllib.request
+import zipfile
 
-__version__ = "1.5.0"
-UPDATE_REPO = "baadee55/link-bond"  # a newer release on GitHub is announced (checked once a day, ~5 KB)
+__version__ = "1.5.1"
+UPDATE_REPO = "baadee55/link-bond"  # newer releases on GitHub are installed by themselves (checked every 6 h, ~5 KB)
 
 HERE = os.path.dirname(sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__))  # next to the .exe
 STATE_DIR = HERE  # where flag files and usage.json live (the self-test points this at a temp folder)
@@ -38,6 +44,7 @@ UP_BYTES = 200_000       # ...and upload
 SMALL_DOWN, SMALL_UP = 300_000, 100_000  # the small first test of a link nobody has measured yet (~0.4 MB)
 RESCAN_SEC = 8           # how often to look for links appearing / disappearing
 REMEASURE_SEC = 0        # periodic full speed tests: off (they cost ~3 MB per link); --remeasure-hours to turn on
+CAP_SANE_MBPS = 5000  # no phone, Wi-Fi or USB link does more; a bigger number is a counting error
 CAP_HALF_LIFE = 3 * 86400  # a link's best real speed ("capacity") halves in 3 days unless it is reached again
 PAUSE_SEC = 30           # a link that fails to connect is skipped for this long
 DECAY_SEC = 5            # recent-traffic memory: halves in ~20 s
@@ -47,7 +54,14 @@ PROBE_HOST, PROBE_PORT, PROBE_PATH = "cp.cloudflare.com", 80, "/generate_204"  #
 PING_HOST, PING_PORT = "8.8.8.8", 53  # the cheap check: one tiny DNS question to Google Public DNS (~200 bytes)
 PROBE_SEC = 15           # cheap check interval per link (~1.2 MB a day per link)
 HTTP_CHECK_SEC = 120     # the HTTP check runs this often (~0.5 MB a day per link), and at once when a ping fails
-FAILS_TO_DOWN = 3        # consecutive failed checks before a link counts as cut (~45 s)
+FAILS_TO_DOWN = 3        # consecutive failed checks before a link counts as cut (fast re-checks: ~8 s)
+FAST_SEC = 2.5           # a link that missed a check is re-checked this often until it is clearly up or down
+DOWN_CHECK_SEC = 5       # a cut link is checked this often (cheap DNS question) so it is back in seconds
+DOWN_SLOW_AFTER = 600    # ... and every PROBE_SEC once it has been cut for this long
+PROBATION_SEC = 60       # a link that just came back gets a smaller share for this long
+NOTIFY_DOWN_AFTER = 20   # a cut is only notified when it lasts this long (blips are only recorded)
+HOLD_SEC = 15            # when no link works, a new connection waits this long for one to come back
+STAGGER_MIN, STAGGER_MAX = 0.25, 1.5  # start the next link after 2 x its answer time, within these bounds (s)
 REMIND_SEC = 1800        # repeat the "still cut" notice this often
 labels = {}              # adapter name -> friendly name (labels.local.txt)
 no_notify = False
@@ -58,6 +72,7 @@ REPORT_HOUR = 9          # the daily usage report is shown at the first scan aft
 
 links = {}  # ifindex -> link dict
 live = {}  # token -> {"link", "sw", "cw", "t_open", "t_data"} for every open tunnel
+last_open_ok = time.time()  # when a connection last went through (the supervisor's fail-open check reads it)
 BUSY_SEC = 3    # a tunnel that moved data within this many seconds counts as busy
 NEW_SEC = 5     # ...and a freshly opened one counts as busy for this long (so a burst of new connections spreads)
 history = {}  # label -> deque of Mbps samples carried through the proxy
@@ -78,13 +93,132 @@ def log(*a):
         print(line.encode(enc, "replace").decode(enc, "replace"), flush=True)
     except Exception:
         pass
+    conn_record("log", text=" ".join(str(x) for x in a))
+
+
+# ---------- connection record: everything about the links, kept 14 days (connlog/YYYY-MM-DD.jsonl) ----------
+# Every 15 s one line per link (alive? answer time, loss, quality, address, gateway, speed now), plus every log
+# line (link added / gone / cut / back / rejoin / network changed ...). UTF-8 JSON lines: easy to read back and
+# to find out when and why a link drops.
+CONNLOG_DAYS = 14
+_connlog_pruned = [""]
+_connlog_file = {}
+_connlog_lock = threading.Lock()
+
+
+def conn_record(kind, **fields):
+    try:
+        d = os.path.join(STATE_DIR, "connlog")
+        os.makedirs(d, exist_ok=True)
+        day = time.strftime("%Y-%m-%d")
+        rec = {"t": time.strftime("%Y-%m-%d %H:%M:%S"), "kind": kind}
+        rec.update(fields)
+        with _connlog_lock:
+            f = _connlog_file.get(day)
+            if f is None or f.closed or _connlog_file.get("dir") != d:
+                for old in [v for k, v in _connlog_file.items() if k != "dir"]:
+                    old.close()
+                _connlog_file.clear()
+                f = _connlog_file[day] = open(os.path.join(d, day + ".jsonl"), "a", encoding="utf-8")
+                _connlog_file["dir"] = d
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            f.flush()
+        if _connlog_pruned[0] != day:  # once a day: forget files older than CONNLOG_DAYS
+            _connlog_pruned[0] = day
+            limit = time.time() - CONNLOG_DAYS * 86400
+            for n in os.listdir(d):
+                if n.endswith(".jsonl") and os.path.getmtime(os.path.join(d, n)) < limit:
+                    os.remove(os.path.join(d, n))
+    except Exception:
+        pass
+
+
+def history_days():
+    try:
+        return sorted((n[:-6] for n in os.listdir(os.path.join(STATE_DIR, "connlog")) if n.endswith(".jsonl")), reverse=True)
+    except OSError:
+        return []
+
+
+def history_data(day):
+    """One day of the connection record: per device a minute-by-minute state ('ok' / 'slow' / 'bad' / 'doubt' /
+    'cut' / 'gone'), answer times, drops and % up, plus the events. For the history page."""
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day or ""):
+        return None
+    path = os.path.join(STATE_DIR, "connlog", day + ".jsonl")
+    rank = {"ok": 0, "slow": 1, "doubt": 2, "bad": 3, "cut": 4}
+    devs, events, nolink = {}, [], set()
+    try:
+        f = open(path, encoding="utf-8")
+    except OSError:
+        return None
+    with f:
+        for line in f:
+            try:
+                r = json.loads(line)
+                t = r["t"][11:16]
+                minute = int(t[:2]) * 60 + int(t[3:5])
+            except (ValueError, KeyError, IndexError, TypeError):
+                continue
+            if not isinstance(r, dict):
+                continue
+            k = r.get("kind")
+            if k == "link":
+                st = "cut" if not r.get("ok") else ("doubt" if r.get("suspect") else
+                                                   {"bad": "bad", "slow": "slow"}.get(r.get("quality"), "ok"))
+                d = devs.setdefault(r.get("link", "?"), {"min": {}, "rtt": {}, "pages": {}})
+                if rank[st] >= rank.get(d["min"].get(minute, "ok"), 0) or minute not in d["min"]:
+                    d["min"][minute] = st
+                if r.get("rtt_ms") is not None:
+                    d["rtt"].setdefault(minute, []).append(r["rtt_ms"])
+                if r.get("page"):
+                    d["pages"][r["page"]] = r["t"][11:19]
+            elif k == "none":
+                nolink.add(minute)
+            elif k == "event":
+                events.append({"t": r["t"][11:19], "text": r.get("text", "")})
+    out = {"day": day, "days": history_days(), "devices": [], "events": events[-300:], "nolink": sorted(nolink)}
+    for name, d in sorted(devs.items()):
+        mins = d["min"]
+        seen = sorted(mins)
+        drops, prev = 0, None
+        for m in seen:
+            if mins[m] == "cut" and prev not in (None, "cut"):
+                drops += 1
+            prev = mins[m]
+        up = sum(1 for m in seen if mins[m] != "cut")
+        rtt = {m: sorted(v)[len(v) // 2] for m, v in d["rtt"].items()}
+        out["devices"].append({"name": name, "states": {str(m): v for m, v in mins.items()},
+                               "rtt": {str(m): v for m, v in rtt.items()}, "drops": drops,
+                               "up_pct": round(100 * up / len(seen)) if seen else None,
+                               "minutes": len(seen), "pages": d["pages"]})
+    return out
+
+
+def conn_snapshot():
+    """One line per link (and per stopped tethering / Wi-Fi adapter) for the connection record."""
+    if not links:
+        conn_record("none")
+    for l in sorted(links.values(), key=label):
+        conn_record("link", link=label(l), adapter=l["name"], ip=l["ip"], gw=l.get("gw") or "",
+                    ok=l["healthy"], rtt_ms=l["rtt"], loss_pct=l["loss"], quality=quality(l), suspect=l.get("suspect", False),
+                    page=l.get("page", "") if l.get("why") == "redirect" else "",
+                    why=l.get("why") or "", down_mbps=l.get("now_down", 0.0), up_mbps=l.get("now_up", 0.0),
+                    conns=sum(1 for r in live.values() if r["link"] is l))
+    for n in sorted(stalled):
+        conn_record("stalled", adapter=n)
+    for desc, w in wifi_last.items():
+        if w.get("lost"):
+            conn_record("wifi_lost", adapter=desc, profile=w["profile"], tries=w["tries"],
+                        lost_for_s=int(time.time() - w["lost"]))
 
 
 def new_link(idx, name, ip):
     return dict(idx=idx, name=name, ip=ip, down=1.0, up=1.0, active=0, total=0, bytes=0, paused_until=0.0,
                 measured_at=0.0, measured=False, healthy=True, fails=0, why="", down_since=0.0, last_notice=0.0,
                 ctr=None, gw="", conn_fails=0, qc_at=0.0, b_up=0, b_down=0, now_up=0.0, now_down=0.0,
-                http_at=0.0, pings=collections.deque(maxlen=20), rtt=None, loss=0, retry_at=0.0, measuring=False)
+                http_at=0.0, pings=collections.deque(maxlen=20), rtt=None, loss=0, retry_at=0.0, measuring=False,
+                suspect=False, watching=False, probation_until=0.0, told_down=False)
 
 
 # A "link" that means: do not choose, follow Windows routing (used while a VPN holds all traffic).
@@ -504,6 +638,12 @@ def daily_report(now=None):
             if d is not None and d < left_days and d < 30:
                 line += f" ⚠ このペースだと約 {d:.0f} 日で使い切ります / runs out in ~{d:.0f} days"
         lines.append(line)
+    for key, st in sorted(stability.items()):  # how stable each device was yesterday
+        if key.endswith("@prev") and st.get("day") == yday:
+            end = time.mktime(time.strptime(yday, "%Y-%m-%d")) + 86400
+            span = max(end - st.get("first", end - 86400), 1)
+            pct = max(0, min(100, round(100 * (1 - st.get("down_s", 0) / span))))
+            lines.append(f"{key[:-5]}: 切断 {st.get('drops', 0)} 回・つながっていた {pct}% / {st.get('drops', 0)} drops, up {pct}%")
     return f"link-bond: 昨日の通信量 / yesterday's data ({yday})", "\n".join(lines)
 
 
@@ -527,6 +667,7 @@ events = collections.deque(maxlen=30)  # what happened, newest last (shown in th
 
 def add_event(text):
     events.append({"t": time.strftime("%H:%M:%S"), "text": text})
+    conn_record("event", text=text)
 
 
 def fleet_summary():
@@ -610,15 +751,16 @@ PS = (
     "[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
     "$r=Get-NetRoute -AddressFamily IPv4 -DestinationPrefix 0.0.0.0/0 | ForEach-Object {"
     "$a=Get-NetAdapter -InterfaceIndex $_.InterfaceIndex -ErrorAction SilentlyContinue;"
-    "$ip=(Get-NetIPAddress -AddressFamily IPv4 -InterfaceIndex $_.InterfaceIndex -ErrorAction SilentlyContinue|Select-Object -First 1).IPAddress;"
+    "$ip=(Get-NetIPAddress -AddressFamily IPv4 -InterfaceIndex $_.InterfaceIndex -ErrorAction SilentlyContinue|Where-Object {$_.AddressState -eq 'Preferred'}|Select-Object -First 1).IPAddress;"
     "$s=Get-NetAdapterStatistics -Name $a.Name -ErrorAction SilentlyContinue;"
-    "[pscustomobject]@{idx=[int]$_.InterfaceIndex;name=[string]$a.Name;desc=[string]$a.InterfaceDescription;ip=$ip;"
+    "[pscustomobject]@{idx=[int]$_.InterfaceIndex;name=[string]$a.Name;desc=[string]$a.InterfaceDescription;ip=$ip;status=[string]$a.Status;"
     "metric=[int]($_.RouteMetric+$_.InterfaceMetric);gw=[string]$_.NextHop;bytes=[long]($s.SentBytes+$s.ReceivedBytes)}};"
     "$v=@(Get-NetRoute -AddressFamily IPv4 -ErrorAction SilentlyContinue|Where-Object {$_.DestinationPrefix -like '*/1'}).Count -gt 0;"
     "$ap=@(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue|Where-Object {$_.IPAddress -like '169.254.*'}|ForEach-Object {"
     "$x=Get-NetAdapter -InterfaceIndex $_.InterfaceIndex -ErrorAction SilentlyContinue;"
-    "if($x -and $x.Status -eq 'Up'){[string]$x.Name+'|'+[string]$x.InterfaceDescription}});"
-    "ConvertTo-Json -InputObject @{vpn=$v;links=@($r);stalled=@($ap)} -Compress -Depth 4"
+    "if($x -and $x.Status -eq 'Up'){[string]$x.Name+'|'+[string]$x.InterfaceDescription+'|'+[string]$x.ifIndex}});"
+    "$cp=@(Get-NetConnectionProfile -ErrorAction SilentlyContinue|ForEach-Object {[string]$_.InterfaceAlias+'|'+[string]$_.Name});"
+    "ConvertTo-Json -InputObject @{vpn=$v;links=@($r);stalled=@($ap);profiles=$cp} -Compress -Depth 4"
 )
 
 
@@ -629,11 +771,25 @@ def discover_sync():
         capture_output=True, timeout=20, creationflags=0x08000000,
     ).stdout.decode("utf-8", "replace").strip()
     data = json.loads(out or "{}")
+    for row in data.get("links") or []:
+        if row.get("name"):
+            adapter_desc[row["name"]] = row.get("desc") or ""
+            if row.get("idx"):
+                adapter_idx[row["name"]] = int(row["idx"])
+    for row in data.get("stalled") or []:
+        parts = str(row).split("|")
+        if len(parts) >= 3 and parts[2].isdigit():
+            adapter_idx[parts[0]] = int(parts[2])
+    for x in data.get("profiles") or []:
+        alias, _, prof = str(x).partition("|")
+        if alias and prof:
+            net_profile[alias] = prof
     found, vpn = classify(data.get("links") or [], bool(data.get("vpn")))
     return found, vpn, stalled_names(data.get("stalled") or [])
 
 
 stalled = set()  # adapters that are plugged in but got no address (169.254.x): tethering stopped on the phone
+stalled_told = set()  # ... and already notified about
 
 
 def stalled_names(rows):
@@ -642,6 +798,7 @@ def stalled_names(rows):
     out = set()
     for row in rows:
         name, _, desc = str(row).partition("|")
+        desc = desc.rsplit("|", 1)[0] if desc.rsplit("|", 1)[-1].isdigit() else desc
         text = (name + " " + desc).lower()
         if name and not any(w in text for w in SKIP_WORDS + ("bluetooth", "wi-fi direct")):
             out.add(name)
@@ -665,6 +822,8 @@ def classify(rows, slash1=False):
     NordLynx/WireGuard works - or when the two half-internet "/1" routes exist (OpenVPN style, slash1)."""
     found, real_metrics, vpn_metrics = {}, [], []
     for r in rows:
+        if r.get("status", "Up") != "Up":  # Windows keeps the route of a dropped Wi-Fi for a while: not a link
+            continue
         text = (r["name"] + " " + r["desc"]).lower()
         if any(w in text for w in SKIP_WORDS):
             vpn_metrics.append(int(r.get("metric") or 0))
@@ -726,7 +885,7 @@ async def connect_tls(link, host):
     loop = asyncio.get_running_loop()
     s = mk_sock(link)
     try:
-        ip = (await loop.getaddrinfo(host, 443, family=socket.AF_INET))[0][4][0]
+        ip = await resolve(host, 443, via=link)
         await asyncio.wait_for(loop.sock_connect(s, (ip, 443)), 10)
         return await asyncio.open_connection(sock=s, ssl=ssl.create_default_context(), server_hostname=host)
     except BaseException:
@@ -784,9 +943,17 @@ def load_capacity():
     capacity.clear()
     try:
         with open(state_path("capacity.json"), encoding="utf-8") as f:
-            capacity.update({k: v for k, v in json.load(f).items() if isinstance(v, dict)})
-    except (OSError, ValueError):
+            capacity.update({k: v for k, v in json.load(f).items() if sane_capacity(v)})  # drop impossible values
+    except (OSError, ValueError, AttributeError):
         pass
+
+
+def sane_capacity(v):
+    if not isinstance(v, dict):
+        return False
+    d, u, a = v.get("down", 0), v.get("up", 0), v.get("at", 0)
+    num = all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in (d, u, a))
+    return num and 0 <= d <= CAP_SANE_MBPS and 0 <= u <= CAP_SANE_MBPS
 
 
 def save_capacity():
@@ -843,14 +1010,231 @@ async def measure_and_set(l, full=False):
         l["measuring"] = False
 
 
+# ---------- Wi-Fi rejoin: a phone hotspot that dropped is joined again ----------
+# Windows tries to rejoin a dropped Wi-Fi a few times and then gives up (an iPhone hides its hotspot for a while
+# after a drop, so those tries fail). link-bond keeps trying - only the network that was carrying internet as a
+# link on that adapter, never another saved Wi-Fi. It talks to wlanapi directly: on Windows 11 `netsh wlan`
+# needs location permission, these two calls do not.
+WIFI_RETRY_FAST, WIFI_RETRY_SLOW, WIFI_FAST_FOR, WIFI_GIVE_UP = 30, 120, 600, 3 * 3600
+wifi_last = {}     # adapter description -> {"profile", "lost", "next", "tries"}
+adapter_desc = {}  # adapter name -> description (from discovery)
+net_profile = {}   # adapter name -> network name Windows shows for it (= the Wi-Fi profile)
+
+
+class _GUID(ctypes.Structure):
+    _fields_ = [("d1", ctypes.c_ulong), ("d2", ctypes.c_ushort), ("d3", ctypes.c_ushort), ("d4", ctypes.c_ubyte * 8)]
+
+
+class _WLAN_INFO(ctypes.Structure):
+    _fields_ = [("guid", _GUID), ("desc", ctypes.c_wchar * 256), ("state", ctypes.c_ulong)]
+
+
+class _WLAN_PARAMS(ctypes.Structure):
+    _fields_ = [("mode", ctypes.c_ulong), ("profile", ctypes.c_wchar_p), ("ssid", ctypes.c_void_p),
+                ("bssids", ctypes.c_void_p), ("bsstype", ctypes.c_ulong), ("flags", ctypes.c_ulong)]
+
+
+def wlan_call(join=None):
+    """[(description, state)] of the Wi-Fi adapters (state 1 = connected, 4 = disconnected). With join=(description,
+    profile): ask Windows to join that saved profile on that adapter, and return the result code instead."""
+    try:
+        api = ctypes.windll.wlanapi
+    except (OSError, AttributeError):  # no Wi-Fi service on this PC
+        return [] if join is None else -1
+    h, ver = ctypes.c_void_p(), ctypes.c_ulong()
+    if api.WlanOpenHandle(2, None, ctypes.byref(ver), ctypes.byref(h)) != 0:
+        return [] if join is None else -1
+    lst = ctypes.c_void_p()
+    try:
+        if api.WlanEnumInterfaces(h, None, ctypes.byref(lst)) != 0:
+            return [] if join is None else -1
+        n = ctypes.c_ulong.from_address(lst.value).value
+        items = (_WLAN_INFO * n).from_address(lst.value + 8)
+        if join is None:
+            return [(i.desc, i.state) for i in items]
+        for i in items:
+            if i.desc == join[0]:
+                prm = _WLAN_PARAMS(0, join[1], None, None, 1, 0)  # by profile name, infrastructure network
+                return api.WlanConnect(h, ctypes.byref(i.guid), ctypes.byref(prm), None)
+        return -2
+    finally:
+        if lst.value:
+            api.WlanFreeMemory(lst)
+        api.WlanCloseHandle(h, None)
+
+
+def wifi_plan(ifaces, link_names, now):
+    """What to rejoin now: [(adapter description, profile)]. Remembers which network each Wi-Fi link was on."""
+    todo = []
+    by_desc = {d: n for n, d in list(adapter_desc.items())}
+    for desc, state in ifaces:
+        name = by_desc.get(desc)
+        if state == 1:
+            prof = dict(net_profile).get(name or "")
+            if name in link_names and prof:
+                if wifi_last.get(desc, {}).get("profile") != prof:
+                    save_wifi(desc, prof)
+                wifi_last[desc] = {"profile": prof, "lost": 0, "next": 0, "tries": 0}
+            elif desc in wifi_last and prof and prof != wifi_last[desc]["profile"]:
+                wifi_last.pop(desc)  # you (or Windows) chose another network: leave it alone
+            continue
+        w = wifi_last.get(desc)
+        if not w or state != 4:
+            continue
+        if not w["lost"]:
+            w["lost"], w["next"] = now, now + 5
+        if now - w["lost"] > WIFI_GIVE_UP:
+            continue  # tried for hours: the phone is away or you turned it off
+        if now >= w["next"]:
+            w["tries"] += 1
+            w["next"] = now + (WIFI_RETRY_FAST if now - w["lost"] < WIFI_FAST_FOR else WIFI_RETRY_SLOW)
+            todo.append((desc, w["profile"]))
+    return todo
+
+
+def save_wifi(desc, prof):
+    """Remember on disk which network each Wi-Fi adapter carried as a link (a restart while it is down still rejoins)."""
+    try:
+        d = {}
+        try:
+            d = json.load(open(state_path("wifi.json"), encoding="utf-8"))
+        except (OSError, ValueError):
+            pass
+        d[desc] = prof
+        with open(state_path("wifi.json"), "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False)
+    except OSError:
+        pass
+
+
+def load_wifi():
+    try:
+        for desc, prof in json.load(open(state_path("wifi.json"), encoding="utf-8")).items():
+            wifi_last.setdefault(desc, {"profile": prof, "lost": 0, "next": 0, "tries": 0})
+    except (OSError, ValueError, AttributeError):
+        pass
+
+
+async def wifi_loop():
+    load_wifi()
+    while True:
+        await asyncio.sleep(10)
+        try:
+            ifaces = await asyncio.to_thread(wlan_call)
+            for desc, prof in wifi_plan(ifaces, {l["name"] for l in links.values()}, time.time()):
+                w = wifi_last[desc]
+                if w["tries"] == 1:
+                    add_event(f"Wi-Fi が切れたのでつなぎ直します（{prof}） / rejoining Wi-Fi")
+                rc = await asyncio.to_thread(wlan_call, (desc, prof))
+                if rc != 0 and re.search(r" \d+$", prof):  # Windows may show "name 2" for the profile "name"
+                    rc = await asyncio.to_thread(wlan_call, (desc, re.sub(r" \d+$", "", prof)))
+                log(f"rejoining Wi-Fi {prof} (try {w['tries']}): result {rc}")
+        except Exception as e:
+            log("wifi rejoin check failed:", type(e).__name__)
+
+
+# ---------- automatic repair: a stuck phone adapter is restarted (needs install-repair.ps1 once) ----------
+# Some drops are on the PC side: USB tethering that still shows "connected" but carries nothing, an adapter left on
+# a 169.254 address, a Wi-Fi driver that will not rejoin. Restarting that one adapter makes it ask for a new address
+# and reconnect. That needs administrator rights, so it goes through the on-demand task "link-bond-repair"
+# (C:\ProgramData\link-bond-repair, set up once with install-repair.ps1). link-bond only drops a request file;
+# the helper accepts phone adapters only and at most once in 5 minutes / 12 times a day per adapter.
+REPAIR_DIR = os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "link-bond-repair")
+REPAIR_AFTER = {"cut": 90, "stalled": 60, "wifi": 300}  # seconds stuck before a restart is asked for
+REPAIR_EVERY = 600                                      # then at most every 10 minutes per adapter
+adapter_idx = {}   # adapter name -> interface index (from discovery)
+stalled_since = {}  # adapter name -> when it got stuck on a 169.254 address
+repair_last = {}    # interface index -> when a restart was last asked for
+_repair_ok = [None, 0.0]  # is the helper installed? (cached for an hour)
+
+
+def repair_ready(now=None):
+    now = now or time.time()
+    if _repair_ok[0] is None or now - _repair_ok[1] > 3600:
+        ok = os.path.isdir(os.path.join(REPAIR_DIR, "requests"))
+        if ok:
+            try:
+                r = subprocess.run(["schtasks", "/query", "/tn", "link-bond-repair"], capture_output=True, timeout=15,
+                                   creationflags=0x08000000)
+                ok = r.returncode == 0
+            except (OSError, subprocess.SubprocessError):
+                ok = False
+        _repair_ok[0], _repair_ok[1] = ok, now
+    return _repair_ok[0]
+
+
+def repair_plan(now=None):
+    """[(interface index, who, why)] to restart now: a cut link whose adapter is still there (no answer at all,
+    not an "out of data" page), an adapter stuck without an address, a Wi-Fi link that will not rejoin."""
+    now = now or time.time()
+    todo = []
+    for l in list(links.values()):
+        if (not l["healthy"] and l.get("why") == "no-response" and l.get("down_since")
+                and now - l["down_since"] > REPAIR_AFTER["cut"]):
+            todo.append((l["idx"], label(l), "応答なし / no answer"))
+    for name, since in list(stalled_since.items()):
+        if now - since > REPAIR_AFTER["stalled"] and name in adapter_idx:
+            todo.append((adapter_idx[name], labels.get(name, name), "アドレスなし / no address"))
+    by_desc = {d: n for n, d in list(adapter_desc.items())}
+    for desc, w in list(wifi_last.items()):
+        name = by_desc.get(desc)
+        if w.get("lost") and now - w["lost"] > REPAIR_AFTER["wifi"] and name in adapter_idx:
+            todo.append((adapter_idx[name], labels.get(name, name), "Wi-Fi がつながらない / Wi-Fi will not rejoin"))
+    return [(i, who, why) for i, who, why in todo if i and now - repair_last.get(i, 0) > REPAIR_EVERY]
+
+
+def ask_repair(idx):
+    with open(os.path.join(REPAIR_DIR, "requests", f"{int(idx)}.req"), "w", encoding="ascii") as f:
+        f.write(str(int(idx)))
+    r = subprocess.run(["schtasks", "/run", "/tn", "link-bond-repair"], capture_output=True, timeout=20,
+                       creationflags=0x08000000)
+    return r.returncode == 0
+
+
+async def repair_loop():
+    told_missing = 0.0
+    while True:
+        await asyncio.sleep(15)
+        try:
+            for n in list(stalled_since):
+                if n not in stalled:
+                    stalled_since.pop(n)
+            for n in stalled:
+                stalled_since.setdefault(n, time.time())
+            plan = [] if vpn_on else repair_plan()
+            if not plan:
+                continue
+            if not await asyncio.to_thread(repair_ready):
+                if time.time() - told_missing > 86400:  # once a day: say what would help
+                    told_missing = time.time()
+                    add_event("自動復旧は未設定です（link-bond フォルダの install-repair.ps1 を 1 回実行） / auto-repair not set up")
+                continue
+            for idx, who, why in plan:
+                repair_last[idx] = time.time()
+                ok = await asyncio.to_thread(ask_repair, idx)
+                add_event(f"自動復旧: {who} のアダプタの入れ直しを頼みました（{why}） / auto-repair: adapter restart asked")
+                log(f"auto-repair: restart asked for {who} (ifIndex {idx}, {why}): {'sent' if ok else 'task did not start'}")
+        except Exception as e:
+            log("auto-repair check failed:", type(e).__name__)
+
+
 async def refresh_loop():
     global vpn_on, vpn_present, vpn_bypass
     last = None
     while True:
         try:
             found, v, st = await asyncio.to_thread(discover_sync)
+            discovered[0] = True
             for n in st - stalled:
                 log("tethering stopped (no address):", n)
+            for n in st & stalled:  # still stuck on the next scan: tell
+                if n not in stalled_told and not any(l["name"] == n for l in links.values()):
+                    stalled_told.add(n)
+                    lab = labels.get(n, n)
+                    notify_link(f"link-bond: {lab} テザリングが止まっています / tethering stopped",
+                                "ケーブルはつながっていますが、スマホからアドレスが来ていません。スマホでテザリングを OFF→ON してください。\n"
+                                "Connected, but the phone gives no address - switch tethering off and on.")
+            stalled_told.intersection_update(st)
             stalled.clear()
             stalled.update(st)
             bypass = bool(v and links and await bypass_ok())
@@ -875,6 +1259,7 @@ async def refresh_loop():
                 if idx not in found:
                     log("link gone:", links[idx]["name"])
                     gone = links.pop(idx)
+                    _prev_octets.pop(idx, None)
                     drop_link_tunnels(gone)
                     notify_link(*gone_message(gone["name"]))
                     note_flap(label(gone))
@@ -882,9 +1267,11 @@ async def refresh_loop():
                 l = links.get(idx)
                 if l is None:
                     l = links[idx] = new_link(idx, name, ip)
+                    _prev_octets.pop(idx, None)
                     l["gw"] = gw
                     known = adopt_capacity(l)
                     log("link added:", name, ip, f"(known: down {l['down']:.1f} / up {l['up']:.1f} Mbps)" if known else "")
+                    wake_waiters()
                     if name in announced:
                         notify_link(f"link-bond: {label(l)} つながりました / connected", f"{ip}")
                     announced.add(name)
@@ -925,6 +1312,16 @@ async def refresh_loop():
 
 
 # ---------- health check: tell the user when a device loses the internet ----------
+async def probe_ip(link):
+    """The check's own address, asked over this link (another link's answer is not trusted here); when DNS is
+    blocked on this network, the shared lookup."""
+    for srv in DNS_SERVERS:
+        r = await _link_lookup(link, PROBE_HOST, srv)
+        if r:
+            return r[0][0]
+    return await resolve(PROBE_HOST, PROBE_PORT)
+
+
 async def probe(link):
     """(ok, why). why: 'redirect' = answers but is not the internet (captive portal / prepaid credit or data
     used up), 'no-response' = nothing comes back (no signal, tethering off, data cut)."""
@@ -932,7 +1329,7 @@ async def probe(link):
         loop = asyncio.get_running_loop()
         s = mk_sock(link)
         try:
-            ip = (await loop.getaddrinfo(PROBE_HOST, PROBE_PORT, family=socket.AF_INET))[0][4][0]
+            ip = await probe_ip(link)
             await asyncio.wait_for(loop.sock_connect(s, (ip, PROBE_PORT)), 5)
             r, w = await asyncio.open_connection(sock=s)
         except BaseException:
@@ -940,16 +1337,72 @@ async def probe(link):
             raise
         w.write(f"GET {PROBE_PATH} HTTP/1.1\r\nHost: {PROBE_HOST}\r\nConnection: close\r\n\r\n".encode())
         line = await asyncio.wait_for(r.readline(), 6)
-        w.close()
         parts = line.split()
         if len(parts) >= 2 and parts[1] == b"204":
+            w.close()
             return True, ""
+        if parts:  # something else answered: keep where it sends us (an operator's "out of data" page, a login ...)
+            page = parts[1].decode("latin-1", "replace")[:4]
+            try:
+                for _ in range(30):
+                    h = await asyncio.wait_for(r.readline(), 3)
+                    if h in (b"\r\n", b"\n", b""):
+                        break
+                    if h.lower().startswith(b"location:"):
+                        page += " " + h.split(b":", 1)[1].strip().decode("latin-1", "replace")[:200]
+            except Exception:
+                pass
+            link["page"] = page
+        w.close()
         return False, "redirect" if parts else "no-response"
     except Exception:
         return False, "no-response"
 
 
 flap_log = {}  # label -> times (s) the device dropped, newest last
+stability = {}  # label -> {"day", "drops", "down_s", "first"}: today's drops and seconds cut (stability.json)
+
+
+def _stab(key, now):
+    day = time.strftime("%Y-%m-%d", time.localtime(now))
+    st = stability.get(key)
+    if not st or st.get("day") != day:
+        if st:
+            stability[key + "@prev"] = st  # yesterday, for the daily report
+        st = stability[key] = {"day": day, "drops": 0, "down_s": 0.0, "first": now}
+    return st
+
+
+def note_stability(l, what, now=None):
+    now = now or time.time()
+    st = _stab(label(l), now)
+    if what == "down":
+        st["drops"] += 1
+    elif what == "up" and l.get("down_since"):
+        midnight = time.mktime(time.strptime(st["day"], "%Y-%m-%d"))
+        st["down_s"] += now - max(l["down_since"], midnight)
+    try:
+        with open(state_path("stability.json"), "w", encoding="utf-8") as f:
+            json.dump(stability, f, ensure_ascii=False)
+    except OSError:
+        pass
+
+
+def load_stability():
+    try:
+        with open(state_path("stability.json"), encoding="utf-8") as f:
+            stability.update({k: v for k, v in json.load(f).items() if isinstance(v, dict)})
+    except (OSError, ValueError, AttributeError):
+        pass
+
+
+def stability_today(l, now=None):
+    """(drops today, % of today's time it was usable) for one device."""
+    now = now or time.time()
+    st = _stab(label(l), now)
+    down = st["down_s"] + ((now - max(l["down_since"], st["first"])) if not l["healthy"] and l.get("down_since") else 0)
+    span = max(now - st["first"], 1.0)
+    return st["drops"], max(0, min(100, round(100 * (1 - down / span))))
 
 
 def note_flap(key, now=None):
@@ -982,8 +1435,15 @@ def apply_probe(l, ok, why, now=None):
     now = now or time.time()
     if ok:
         l["fails"] = 0
+        l["suspect"] = False
+        l["why"], l["page"], l["probe_bad"] = "", "", False
         if not l["healthy"]:
             l["healthy"], l["paused_until"] = True, 0.0
+            l["probation_until"] = now + PROBATION_SEC
+            try:
+                wake_waiters()
+            except RuntimeError:  # no running loop (a unit test)
+                pass
             return "up"
         return None
     l["fails"] += 1
@@ -1000,37 +1460,82 @@ def apply_probe(l, ok, why, now=None):
 def tell(l, event):
     name = label(l)
     if event == "up":
-        notify_link(f"link-bond: {name} 復旧 / back online", f"{name} はまたネットに出られます。 / {name} has internet again.")
+        secs = int(time.time() - l["down_since"])
+        add_event(f"{name}: 復旧（{secs} 秒切れていました） / back after {secs} s")
+        note_stability(l, "up")
+        if l["told_down"]:
+            l["told_down"] = False
+            notify_link(f"link-bond: {name} 復旧 / back online", f"{name} はまたネットに出られます（{secs} 秒）。 / {name} has internet again.")
         return
-    mins = int((time.time() - l["down_since"]) / 60)
     if event == "down":
         note_flap(name)
+        note_stability(l, "down")
+        add_event(f"{name}: 切断 / cut")
+        drop_link_tunnels(l)
+        asyncio.ensure_future(tell_cut_later(l, l["down_since"]))  # tell only if it lasts
+        return
+    mins = int((time.time() - l["down_since"]) / 60)
     if l["why"] == "redirect":
         jp = "つながっているのにネットに出られません。プリペイドの残高・データ切れ、または認証待ちの可能性があります。"
         en = "Connected but no internet - prepaid credit or data may have run out."
     else:
         jp = "応答がありません。電波なし・テザリングOFF・データ切れの可能性があります。"
         en = "No response - weak signal, tethering off, or data used up."
-    head = "切れました / lost internet" if event == "down" else f"まだ切れています({mins}分) / still cut"
-    if event == "down":
-        drop_link_tunnels(l)
+    head = "切れました / lost internet" if event == "cut" else f"まだ切れています({mins}分) / still cut"
+    if event == "cut":
+        l["told_down"] = True
     notify_link(f"link-bond: {name} {head}", f"{jp}\n{en}")
 
 
+async def tell_cut_later(l, since):
+    """A cut that is over within NOTIFY_DOWN_AFTER s is a blip: recorded, not notified."""
+    await asyncio.sleep(NOTIFY_DOWN_AFTER)
+    if links.get(l["idx"]) is l and not l["healthy"] and l["down_since"] == since:
+        tell(l, "cut")
+
+
+def suspect(l, why="connect"):
+    """Something failed on this link: take it out of the rotation and re-check it every FAST_SEC at once."""
+    if l is SYSTEM_LINK or vpn_on or l.get("idx") not in links:
+        return
+    if l["healthy"] and not l["suspect"]:
+        l["suspect"] = True
+        log(f"link suspect ({why}): {l['name']} - checking it every {FAST_SEC} s")
+    if not l["watching"]:
+        l["watching"] = True
+        asyncio.ensure_future(watch(l))
+
+
+async def watch(l):
+    """Fast checks for a doubtful or cut link until it is clearly fine again. A suspect link is cut after
+    FAILS_TO_DOWN misses in a row (~8 s); a cut link is checked every DOWN_CHECK_SEC so it rejoins in seconds."""
+    try:
+        while l.get("idx") in links and links.get(l["idx"]) is l and not vpn_on:
+            now = time.time()
+            try:
+                ok, why = await check_link(l, now, quick=True)
+                event = apply_probe(l, ok, why)
+                if event:
+                    tell(l, event)
+            except Exception as e:
+                log("quick check failed:", type(e).__name__)
+                ok = False
+            if ok:
+                l["suspect"] = False
+                if l["healthy"]:
+                    return
+            if l["healthy"]:
+                await asyncio.sleep(FAST_SEC)
+            else:
+                cut_for = time.time() - l["down_since"]
+                await asyncio.sleep(DOWN_CHECK_SEC if cut_for < DOWN_SLOW_AFTER else PROBE_SEC)
+    finally:
+        l["watching"] = False
+
+
 async def quick_check(l):
-    """Connections to this link keep failing: check it right now instead of waiting for the next regular check."""
-    now = time.time()
-    if now - l["qc_at"] < 15 or vpn_on:
-        return
-    l["qc_at"] = now
-    ok, why = await probe(l)
-    if ok:
-        l["conn_fails"] = 0
-        return
-    l["fails"] = max(l["fails"], FAILS_TO_DOWN - 1)  # one more miss = cut
-    event = apply_probe(l, False, why)
-    if event:
-        tell(l, event)
+    """Kept for callers: a doubtful link is now handled by suspect() / watch()."""
+    suspect(l)
 
 
 def _dns_question():
@@ -1042,10 +1547,13 @@ DNS_Q = _dns_question()
 
 
 class _OneDatagram(asyncio.DatagramProtocol):
-    def __init__(self):
+    def __init__(self, server=None):
         self.answer = asyncio.get_running_loop().create_future()
+        self.server = server
 
     def datagram_received(self, data, addr):
+        if self.server and addr and addr[0] != self.server:
+            return  # not from the server we asked: ignore
         if not self.answer.done():
             self.answer.set_result(data)
 
@@ -1064,11 +1572,11 @@ async def ping(link):
         if link["idx"] is not None:
             s.setsockopt(socket.IPPROTO_IP, IP_UNICAST_IF, struct.pack("!I", link["idx"]))
             s.bind((link["ip"], 0))
-        tr, pr = await loop.create_datagram_endpoint(_OneDatagram, sock=s)
-        t0 = time.monotonic()
+        tr, pr = await loop.create_datagram_endpoint(lambda: _OneDatagram(PING_HOST), sock=s)
+        t0 = time.perf_counter()
         tr.sendto(DNS_Q, (PING_HOST, PING_PORT))
         data = await asyncio.wait_for(pr.answer, 3)
-        return len(data) >= 12 and data[:2] == DNS_Q[:2], round((time.monotonic() - t0) * 1000)
+        return len(data) >= 12 and data[:2] == DNS_Q[:2], round((time.perf_counter() - t0) * 1000)
     except Exception:
         return False, None
     finally:
@@ -1076,6 +1584,244 @@ async def ping(link):
             tr.close()
         else:
             s.close()
+
+
+# ---------- names -> addresses, built for unstable links ----------
+# Windows asks the DNS server of ONE adapter; when that phone is cut, every name lookup hangs for seconds even
+# though other links work. link-bond asks Google / Cloudflare DNS over every working link at the same time AND
+# Windows itself, takes the first good answer, keeps it for its TTL, and when nothing answers it uses the last
+# known address (a name rarely moves). Local names (no dot, .local, the hosts file) go to Windows only.
+DNS_SERVERS = ("8.8.8.8", "1.1.1.1")  # noqa: secret - public DNS of Google and Cloudflare, not personal
+DNS_MIN_TTL, DNS_MAX_TTL, DNS_STALE_SEC, DNS_CACHE_MAX = 30, 3600, 86400, 4000
+dns_cache = {}  # name -> [addresses, fresh until, usable as a last resort until]
+LOCAL_SUFFIXES = (".local", ".lan", ".home", ".internal", ".localhost", ".arpa", ".test")
+
+
+def dns_packet(name):
+    """(query id, packet) for an A question about `name`. ValueError for a name DNS cannot carry."""
+    labels_ = name.rstrip(".").split(".")
+    if not name or len(name) > 253 or any(not x or len(x) > 63 for x in labels_):
+        raise ValueError("bad name")
+    qid = int.from_bytes(os.urandom(2), "big")
+    q = b"".join(bytes([len(x)]) + x.encode("idna") for x in labels_) + b"\0"
+    return qid, struct.pack("!HHHHHH", qid, 0x0100, 1, 0, 0, 0) + q + struct.pack("!HH", 1, 1)
+
+
+def _dns_name(data, off):
+    """Read a (possibly compressed) name: (lower-case name, offset after it)."""
+    parts, jumped, end, hops = [], False, off, 0
+    while True:
+        if off >= len(data) or hops > 30:
+            raise ValueError("bad name")
+        n = data[off]
+        if n == 0:
+            off += 1
+            break
+        if n & 0xC0 == 0xC0:
+            if off + 1 >= len(data):
+                raise ValueError("bad pointer")
+            if not jumped:
+                end = off + 2
+            off, jumped, hops = ((n & 0x3F) << 8) | data[off + 1], True, hops + 1
+            continue
+        parts.append(data[off + 1:off + 1 + n].decode("ascii", "replace").lower())
+        off += 1 + n
+    return ".".join(parts), (end if jumped else off)
+
+
+def dns_answer(data, qid, name):
+    """The IPv4 addresses and smallest TTL in a DNS reply to OUR question, or None (wrong id / name, truncated,
+    an error, no address)."""
+    try:
+        if len(data) < 12:
+            return None
+        rid, flags, qd, an, _, _ = struct.unpack("!HHHHHH", data[:12])
+        if rid != qid or not flags & 0x8000 or flags & 0x0200 or flags & 0x000F or qd != 1:
+            return None
+        qn, off = _dns_name(data, 12)
+        if qn != name.lower().rstrip("."):
+            return None
+        off += 4
+        ips, ttl = [], DNS_MAX_TTL
+        for _ in range(an):
+            _, off = _dns_name(data, off)
+            typ, cls, t, ln = struct.unpack("!HHIH", data[off:off + 10])
+            off += 10
+            if typ == 1 and cls == 1 and ln == 4:
+                ips.append(socket.inet_ntoa(data[off:off + 4]))
+                ttl = min(ttl, t)
+            off += ln
+        return (ips, ttl) if ips else None
+    except (ValueError, struct.error, IndexError):
+        return None
+
+
+async def dns_over(link, name, server, timeout=2.0):
+    """Ask `server` about `name` over this link only. (addresses, ttl) or None."""
+    loop = asyncio.get_running_loop()
+    qid, pkt = dns_packet(name)
+    sk = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sk.setblocking(False)
+    tr = None
+    try:
+        if link["idx"] is not None:
+            sk.setsockopt(socket.IPPROTO_IP, IP_UNICAST_IF, struct.pack("!I", link["idx"]))
+            sk.bind((link["ip"], 0))
+        tr, pr = await loop.create_datagram_endpoint(lambda: _OneDatagram(server), sock=sk)
+        tr.sendto(pkt, (server, 53))
+        return dns_answer(await asyncio.wait_for(pr.answer, timeout), qid, name)
+    except Exception:
+        return None
+    finally:
+        if tr:
+            tr.close()
+        else:
+            sk.close()
+
+
+_DNS_POOL = concurrent.futures.ThreadPoolExecutor(4, thread_name_prefix="dns")  # Windows lookups only, never the
+_inflight = {}  # (name, link) -> the one lookup running for it                    # shared pool (it would starve)
+# An "out of data" or login page often answers EVERY name with its own private address. Such answers from the
+# public DNS over a link are thrown away; from Windows they are only used when nothing better comes within 0.5 s.
+def _not_public(a, strict):
+    """strict: anything that is not a normal internet address (private, shared, loopback, link-local, multicast,
+    reserved). Not strict: only the ranges an operator's page would use - loopback and 0.0.0.0 are left alone,
+    because a hosts file blocks names with them on purpose."""
+    if strict:
+        return not a.is_global or a.is_multicast
+    if a.is_loopback or a.is_unspecified or (a.version == 4 and a.packed[0] == 0):
+        return False
+    return not a.is_global and not a.is_multicast
+
+
+def public_ips(ips, strict=True):
+    out = []
+    for i in ips:
+        try:
+            if not _not_public(ipaddress.ip_address(i), strict):
+                out.append(i)
+        except ValueError:
+            pass
+    return out
+
+
+async def _system_lookup(name, port):
+    loop = asyncio.get_running_loop()
+    try:
+        infos = await asyncio.wait_for(loop.run_in_executor(
+            _DNS_POOL, socket.getaddrinfo, name, port, socket.AF_INET, socket.SOCK_STREAM), 10)
+        ips = list(dict.fromkeys(i[4][0] for i in infos))
+        return (ips, 300, "sys") if ips else None
+    except Exception:
+        return None
+
+
+async def _link_lookup(link, name, server):
+    r = await dns_over(link, name, server)
+    if not r:
+        return None
+    ips = public_ips(r[0])
+    return (ips, r[1], link["idx"]) if ips else None
+
+
+def flush_link_cache(idx):
+    """A link turned out to show an 'out of data' / login page: forget the addresses it told us."""
+    for k in [k for k, v in dns_cache.items() if len(v) > 3 and v[3] == idx]:
+        dns_cache.pop(k, None)
+
+
+def is_ip(host):
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
+async def resolve(host, port=443, via=None):
+    """One IPv4 address for `host`. A known address is used at once (an expired one too, while a fresh lookup runs
+    in the background); a new name is looked up over every working link and Windows at the same time.
+    `via` = look it up over that link only (a link's own check must not trust what another link said)."""
+    if is_ip(host):
+        return host
+    name = host.lower().rstrip(".")
+    now = time.time()
+    if via is None:
+        c = dns_cache.get(name)
+        if c and c[1] > now:
+            return c[0][0]
+        if c and c[2] > now:  # expired but known: use it now, refresh it in the background
+            _single(name, port, None)
+            return c[0][0]
+    r = await asyncio.shield(_single(name, port, via))
+    if r:
+        return r[0][0]
+    c = dns_cache.get(name)
+    if c and c[2] > now:  # nothing answers: the last known address is far better than a failure
+        return c[0][0]
+    raise ConnectionError("cannot resolve " + host)
+
+
+def _single(name, port, via):
+    """One lookup per name at a time, however many connections want it."""
+    key = (name, via["idx"] if via is not None else None)
+    f = _inflight.get(key)
+    if f is None or f.done():
+        f = _inflight[key] = asyncio.ensure_future(_lookup(name, port, via))
+        f.add_done_callback(lambda _f, k=key: _inflight.pop(k, None) if _inflight.get(k) is _f else None)
+    return f
+
+
+async def _lookup(name, port, via):
+    loop = asyncio.get_running_loop()
+    local = "." not in name or name.endswith(LOCAL_SUFFIXES) or name == "localhost"
+    jobs = [asyncio.ensure_future(_system_lookup(name, port))]
+    if not local and not vpn_on:
+        ls = [via] if via is not None else sorted((l for l in links.values() if l["healthy"] and not l["suspect"]),
+                                                  key=lambda l: l["rtt"] or 999)[:3]
+        for k, l in enumerate(ls):
+            jobs.append(asyncio.ensure_future(_link_lookup(l, name, DNS_SERVERS[k % 2])))
+            jobs.append(asyncio.ensure_future(_later(0.8, lambda l=l, k=k: _link_lookup(l, name, DNS_SERVERS[(k + 1) % 2]))))
+    got, private, private_at, end = None, None, None, loop.time() + 5
+    pending = set(jobs)
+    try:
+        while pending and got is None:
+            left = end - loop.time()
+            if private is not None:
+                left = min(left, private_at + 0.5 - loop.time())
+            if left <= 0:
+                break
+            done, pending = await asyncio.wait(pending, timeout=left, return_when=asyncio.FIRST_COMPLETED)
+            if not done:
+                break
+            for d in done:
+                r = d.result() if not d.cancelled() and d.exception() is None else None
+                if not r:
+                    continue
+                if r[2] == "sys" and not local and not public_ips(r[0], strict=False):
+                    if private is None:  # a private address for a public name: maybe an operator's page
+                        private, private_at = r, loop.time()
+                    continue
+                got = r
+                break
+    finally:
+        for j in jobs:
+            j.cancel()
+    got = got or private
+    if got and via is None:
+        now = time.time()
+        if len(dns_cache) >= DNS_CACHE_MAX:
+            for k in sorted(dns_cache, key=lambda k: dns_cache[k][1])[:DNS_CACHE_MAX // 4]:
+                dns_cache.pop(k, None)
+        ttl = max(DNS_MIN_TTL, min(DNS_MAX_TTL, got[1]))
+        dns_cache[name] = [got[0], now + ttl, now + DNS_STALE_SEC, got[2]]
+    return got
+
+
+async def _later(delay, make):
+    """make() after delay seconds (the coroutine is only created if it is still wanted)."""
+    await asyncio.sleep(delay)
+    return await make()
 
 
 def note_ping(l, ok, rtt):
@@ -1100,19 +1846,34 @@ def quality(l):
     return "good"
 
 
-async def check_link(l, now):
-    """One regular check: the cheap DNS question; the HTTP check only every HTTP_CHECK_SEC or when that fails
-    (it tells 'no answer at all' from 'a prepaid / login page answers instead of the internet')."""
+async def check_link(l, now, quick=False):
+    """One check. The cheap DNS question says whether the link answers; the web check (HTTP) says whether the
+    internet really works - with prepaid data used up, DNS still answers but nothing else goes through. So the web
+    check runs whenever the DNS question failed, whenever the link is in doubt or cut (quick checks), whenever the
+    last web check failed, and every HTTP_CHECK_SEC. Its answer wins. Real traffic arriving on the link also counts
+    as proof that it works."""
     ok, rtt = await ping(l)
     note_ping(l, ok, rtt)
     why = ""
-    if not ok or now - l["http_at"] >= HTTP_CHECK_SEC:
+    bad_before = l.get("probe_bad", False)
+    need = (not ok or bad_before or now - l["http_at"] >= HTTP_CHECK_SEC
+            or (quick and (l["suspect"] or not l["healthy"])))
+    if need and not l["healthy"] and now - l["down_since"] > DOWN_SLOW_AFTER and now - l["http_at"] < 60:
+        need = False  # cut for a long time: one web check a minute is enough (prepaid data)
+    if need:
         l["http_at"] = now
         hok, why = await probe(l)
-        if ok and not hok and why == "redirect":
-            ok = False            # DNS answers, but the web is an "out of credit" page
-        elif not ok and hok:
-            ok, why = True, ""    # DNS is blocked on this network, but the internet works
+        l["probe_bad"] = not hok
+        if hok:
+            ok, why = True, ""   # the web works (DNS may simply be blocked on this network)
+        else:
+            ok = False
+            if why == "redirect":
+                flush_link_cache(l["idx"])
+    elif bad_before:
+        ok, why = False, l.get("why") or "no-response"
+    if not ok and time.time() - l.get("data_at", 0) < 10:
+        ok, why = True, ""       # data is coming in over it right now: it works
     return ok, why
 
 
@@ -1126,16 +1887,43 @@ async def health_tick():
     if not ls:
         return
     now = time.time()
+    ls = [l for l in ls if not l["watching"]]
     for l, (ok, why) in zip(ls, await asyncio.gather(*(check_link(l, now) for l in ls))):
+        if not ok:
+            suspect(l, "check")  # re-checked every FAST_SEC from now on: cut in seconds, not in 45 s
+            continue
         event = apply_probe(l, ok, why)
         if event:
             tell(l, event)
 
 
+discovered = [False]  # the first discovery has finished (no "all down" before we even know the links)
+
+
 async def health_loop():
+    any_ok, misses = True, 0
     while True:
         await asyncio.sleep(PROBE_SEC)
-        await health_tick()
+        try:
+            await health_tick()
+        except Exception as e:
+            log("health check failed:", type(e).__name__, str(e)[:80])
+        try:
+            conn_snapshot()
+        except Exception as e:
+            log("connection record failed:", type(e).__name__)
+        now_ok = any(l["healthy"] for l in links.values())
+        misses = 0 if now_ok else misses + 1
+        if not discovered[0] or (not now_ok and misses < 2):
+            continue
+        if any_ok and not now_ok and not vpn_on:
+            notify("link-bond: 全部の回線が切れています / ALL links are down",
+                   "ネットに出られる回線がありません。スマホのテザリング・電波・データ残量を確かめてください。\n"
+                   "No link reaches the internet: check the phones' tethering, signal and data.")
+            add_event("全部の回線が切れました / all links down")
+        elif not any_ok and now_ok:
+            add_event("回線が戻りました / a link is back")
+        any_ok = now_ok
 
 
 async def decay_loop():
@@ -1152,9 +1940,15 @@ def upload_share():
 
 
 def weight(l):
-    """Expected usefulness (Mbps) given what the PC is doing right now: mostly uploading -> uplink counts more."""
+    """Expected usefulness (Mbps) given what the PC is doing right now: mostly uploading -> uplink counts more.
+    A link that just came back, or keeps dropping, gets a smaller share: on unstable links the steady one should
+    carry the long downloads and streams."""
     s = upload_share()
-    return max(l["down"] * (1 - s) + l["up"] * s, 0.2)
+    w = max(l["down"] * (1 - s) + l["up"] * s, 0.2)
+    if l.get("probation_until", 0) > time.time():
+        w *= 0.3
+    flaps = len([t for t in flap_log.get(label(l), []) if time.time() - t < 1800]) if l is not SYSTEM_LINK else 0
+    return w / (1 + flaps)
 
 
 def candidates(host, only=None):
@@ -1164,7 +1958,8 @@ def candidates(host, only=None):
     now = time.time()
     if only is not None:
         return [l for l in links.values() if label(l) == only and l["healthy"]]
-    u = [l for l in links.values() if l["paused_until"] <= now and l["healthy"]] or list(links.values())
+    u = ([l for l in links.values() if l["paused_until"] <= now and l["healthy"] and not l["suspect"]]
+         or [l for l in links.values() if l["healthy"]] or list(links.values()))
     if is_pinned(host):
         return sorted(u, key=lambda l: -weight(l))
     # ALL links are used at the same time, each in proportion to its speed: the next connection goes to the link
@@ -1173,43 +1968,162 @@ def candidates(host, only=None):
 
 
 async def open_via(host, port, only=None):
-    global blocked_total
+    """Connect to host:port over the best link. On unstable links: if the first link does not connect within
+    ~2x its answer time, the next one is tried at the same time, and the first to connect wins (a dead link costs
+    a fraction of a second, not 4 s). When no link works at all, it waits up to HOLD_SEC for one to come back."""
+    global blocked_total, last_open_ok
     if is_blocked(host):
         blocked_total += 1
         blocked_hosts[host.lower()] += 1
         raise PermissionError("blocked: " + host)
-    loop = asyncio.get_running_loop()
-    try:
-        ip = (await loop.getaddrinfo(host, port, family=socket.AF_INET))[0][4][0]
-    except Exception:
-        raise ConnectionError("cannot resolve " + host)
+    deadline = time.time() + HOLD_SEC
     last = None
-    cands = candidates(host, only)
-    if not cands:
-        raise ConnectionError(f"link {only!r} is not available")
-    if cands != [SYSTEM_LINK] and not vpn_bypass and best_if(ip) not in links:
-        cands = [SYSTEM_LINK]  # Windows routes this destination somewhere else (VPN just started, ...): follow it
-    for k, l in enumerate(cands):
-        s = None
+    while True:
         try:
-            s = mk_sock(l)
-            # a dead link must not hold a page up: give up on it after 4 s and try the next one
-            await asyncio.wait_for(loop.sock_connect(s, (ip, port)), 4 if k < len(cands) - 1 else 8)
-            r, w = await asyncio.open_connection(sock=s)
-            l["active"] += 1
-            l["total"] += 1
-            l["conn_fails"] = 0
-            return l, r, w
-        except Exception as e:
+            ip = await resolve(host, port)
+        except ConnectionError as e:
             last = e
-            if s:
-                s.close()
-            l["paused_until"] = time.time() + PAUSE_SEC
-            l["conn_fails"] += 1
-            if l["conn_fails"] >= 2 and l is not SYSTEM_LINK:
-                asyncio.create_task(quick_check(l))
-            log("connect failed, pausing link:", l["name"], host, type(e).__name__)
+            ip = None
+        cands = candidates(host, only) if ip else []
+        if ip and not cands and only is not None:
+            raise ConnectionError(f"link {only!r} is not available")
+        if ip and not cands:
+            last = ConnectionError("no link at the moment")  # every adapter is gone: wait for one below
+        if ip and cands:
+            if cands != [SYSTEM_LINK] and not vpn_bypass and best_if(ip) not in links:
+                cands = [SYSTEM_LINK]  # Windows routes this destination somewhere else (VPN just started, ...)
+            try:
+                l, r, w = await race_connect(cands, ip, port, host)
+                last_open_ok = time.time()
+                return l, r, w
+            except ConnectionError as e:
+                last = e
+        if only is not None or cands_is_system() or time.time() >= deadline:
+            break
+        if ip and any(l["healthy"] and not l["suspect"] for l in links.values()):
+            break  # links work: it is this server that does not answer - fail now, do not hold
+        await wait_for_link(min(2.0, max(0.1, deadline - time.time())))
     raise ConnectionError(f"no link could reach {host} ({last})")
+
+
+def cands_is_system():
+    return vpn_on
+
+
+link_back = None  # an asyncio.Event made in serve(): wakes connections waiting for a link to come back
+
+
+async def wait_for_link(timeout):
+    ev = link_back
+    if ev is None:
+        await asyncio.sleep(timeout)
+        return
+    try:
+        await asyncio.wait_for(ev.wait(), timeout)
+    except asyncio.TimeoutError:
+        pass
+
+
+def wake_waiters():
+    """A link is (back) up: wake every connection that waits. The signal stays on for a second (none is missed)."""
+    if link_back is not None:
+        link_back.set()
+        asyncio.get_running_loop().call_later(1.0, link_back.clear)
+
+
+async def link_connect(l, sk, addr):
+    """The TCP connect itself (one place, so the self-test can make a link that never answers)."""
+    await asyncio.get_running_loop().sock_connect(sk, addr)
+
+
+def stagger(l):
+    rtt = (l.get("rtt") or 300) / 1000
+    return max(STAGGER_MIN, min(STAGGER_MAX, 2 * rtt))
+
+
+_fail_logged = {}  # (link, host) -> when a failure was last written to the log
+
+
+async def race_connect(cands, ip, port, host):
+    """Staggered connect: start on the best link, add the next one when the first is slow. First to connect wins;
+    the losers are closed without counting as failures. Returns (link, reader, writer)."""
+    a = ipaddress.ip_address(ip)
+    if a.is_multicast or a.is_unspecified or a.is_reserved:
+        raise ConnectionError(f"{ip} cannot be connected to")  # not a link problem: no suspicion
+    loop = asyncio.get_running_loop()
+    socks = {}
+
+    async def attempt(l, timeout):
+        sk = mk_sock(l)
+        socks[id(l)] = sk
+        await asyncio.wait_for(link_connect(l, sk, (ip, port)), timeout)
+        return l, sk
+
+    pending, errors, winner, of = set(), [], None, {}
+    order = list(cands)
+    try:
+        while order or pending:
+            if order and winner is None:
+                l = order.pop(0)
+                t = asyncio.ensure_future(attempt(l, 8 if not order else 6))
+                of[t] = l
+                pending.add(t)
+                wait = stagger(l) if order else None
+            else:
+                wait = None
+            done, pending = await asyncio.wait(pending, timeout=wait, return_when=asyncio.FIRST_COMPLETED)
+            for t in done:
+                if t.exception() is None:
+                    if winner is None:
+                        winner = t.result()
+                else:
+                    l, e = of[t], t.exception()
+                    errors.append(e)
+                    try:
+                        socks.pop(id(l)).close()
+                    except Exception:
+                        pass
+                    if not isinstance(e, ConnectionRefusedError):  # refused = the server said no: the link works
+                        l["conn_fails"] += 1
+                        # some hosts never answer anywhere (trackers blocked by the network): one host timing out
+                        # is not the link's fault - two different hosts within 30 s are
+                        th = l.setdefault("to_hosts", {})
+                        tnow = time.time()
+                        th[host] = tnow
+                        for h in [h for h, t in th.items() if tnow - t > 30]:
+                            th.pop(h, None)
+                        others = any(x is not l and x["healthy"] and not x["suspect"] for x in links.values())
+                        if l is not SYSTEM_LINK and (len(th) >= 2 or not others):
+                            suspect(l, "connect")
+                    key = (l["name"], host)
+                    if time.time() - _fail_logged.get(key, 0) > 60:  # the record does not need every retry
+                        _fail_logged[key] = time.time()
+                        log("connect failed:", l["name"], host, type(e).__name__)
+            if winner is not None:
+                break
+            if not pending and not order:
+                break
+    finally:
+        for t in pending:  # the slower attempts: not failures, just not needed
+            t.cancel()
+        for k, sk in list(socks.items()):
+            if winner is None or k != id(winner[0]):
+                try:
+                    sk.close()
+                except Exception:
+                    pass
+    if winner is None:
+        raise ConnectionError(str(errors[-1]) if errors else "no link")
+    l, sk = winner
+    try:
+        r, w = await asyncio.open_connection(sock=sk)
+    except Exception:
+        sk.close()
+        raise ConnectionError("connection lost at once")
+    l["active"] += 1
+    l["total"] += 1
+    l["conn_fails"] = 0
+    return l, r, w
 
 
 async def pipe(r, w, link, kind, rule=None, rec=None):
@@ -1223,6 +2137,8 @@ async def pipe(r, w, link, kind, rule=None, rec=None):
                 rec["t_data"] = time.time()
             link["bytes"] += len(b)
             link["b_" + kind] += len(b)
+            if kind == "down":
+                link["data_at"] = time.time()
             traffic[kind] += len(b)
             if rule:
                 rule.bytes += len(b)
@@ -1348,9 +2264,14 @@ async def http_proxy(cr, cw, head, only=None):
 DOWNLOAD_DIR = os.path.join(os.path.expanduser("~"), "Downloads")
 CHUNK = 1 << 20
 WORKERS_PER_LINK = 3
+DL_OUTAGE_MAX = 900      # a download waits this long for a link to come back before it gives up
 ALLOW_LOCAL_DOWNLOADS = False  # tests only
 downloads = {}                 # id -> job dict
 _dl_seq = 0
+
+
+class ServerError(Exception):
+    """The server answered with an error (404 ...): retrying over another link would not help."""
 
 
 class Aborted(Exception):
@@ -1404,7 +2325,7 @@ class Conn:
         loop = asyncio.get_running_loop()
         s = mk_sock(self.link)
         try:
-            ip = (await loop.getaddrinfo(self.host, self.port, family=socket.AF_INET))[0][4][0]
+            ip = await resolve(self.host, self.port)
             await asyncio.wait_for(loop.sock_connect(s, (ip, self.port)), 10)
             kw = dict(ssl=ssl.create_default_context(), server_hostname=self.host) if self.scheme == "https" else {}
             self.r, self.w = await asyncio.open_connection(sock=s, **kw)
@@ -1472,7 +2393,21 @@ def dl_links():
     """Links a download uses: every working one (slow ones too - work-stealing gives them fewer pieces)."""
     if vpn_on:
         return [SYSTEM_LINK]
-    return [l for l in links.values() if l["healthy"]] or list(links.values())
+    return [l for l in links.values() if l["healthy"] and not l["suspect"]] or [l for l in links.values() if l["healthy"]]
+
+
+async def wait_links(job, deadline_s=DL_OUTAGE_MAX):
+    """Every link is cut: the download waits (shown as waiting) and goes on when one is back."""
+    t0 = time.time()
+    while not dl_links():
+        if job["state"] != "running":
+            raise Aborted()
+        if time.time() - t0 > deadline_s:
+            raise ConnectionError("回線が戻りませんでした / no link came back")
+        job["waiting"] = True
+        await asyncio.sleep(2)
+    job["waiting"] = False
+    return dl_links()
 
 
 async def run_download(job):
@@ -1484,14 +2419,23 @@ async def run_download(job):
         def hdrs():  # the browser's cookies only go to the host they belong to (not after a redirect elsewhere)
             return extra if host == first_host else {k: v for k, v in extra.items() if k != "Cookie"}
 
-        ls = dl_links()
-        if not ls:
-            raise ConnectionError("つながっている回線がありません / no connection")
+        ls = await wait_links(job)
         best = max(ls, key=weight)
         # 1. ask for the first byte: follows redirects, learns the size and whether Range works
         for _ in range(6):
-            c = Conn(best, scheme, host, port)
-            status, hdr = await c.request(path, (0, 0), hdrs())
+            for attempt in range(6):  # a link that drops right now: the next one, or wait for one to come back
+                c = Conn(best, scheme, host, port)
+                try:
+                    status, hdr = await c.request(path, (0, 0), hdrs())
+                    break
+                except (OSError, ConnectionError, asyncio.TimeoutError, asyncio.IncompleteReadError):
+                    c.close()
+                    if attempt == 5:
+                        raise
+                    suspect(best, "download")
+                    await asyncio.sleep(1)
+                    ls = await wait_links(job)
+                    best = max(ls, key=weight)
             if status in (301, 302, 303, 307, 308) and hdr.get("location"):
                 c.close()
                 nu = urllib.parse.urljoin(f"{scheme}://{host}:{port}{path}", hdr["location"])
@@ -1524,21 +2468,35 @@ async def run_download(job):
         if not ranged or not total or total <= CHUNK or len(ls) == 0:
             # single stream over the best link (no Range support, unknown or small size)
             job["ranged"] = False
-            with open(part, "wb") as f:
-                c = Conn(best, scheme, host, port)
-                status, hdr = await c.request(path, None, hdrs())
-                if status >= 400:
-                    raise ConnectionError(f"HTTP {status}")
+            for attempt in range(5):
+                with open(part, "wb") as f:
+                    job["done"] = 0
+                    c = Conn(best, scheme, host, port)
+                    try:
+                        status, hdr = await c.request(path, None, hdrs())
+                        if status >= 400:
+                            raise ServerError(f"HTTP {status}")
 
-                def put(b):
-                    if job["state"] != "running":
-                        raise Aborted()
-                    f.write(b)
-                    job["done"] += len(b)
-                    count(best, len(b))
+                        def put(b, l=best):
+                            if job["state"] != "running":
+                                raise Aborted()
+                            f.write(b)
+                            job["done"] += len(b)
+                            count(l, len(b))
 
-                await c.read_body(hdr, put)
-                c.close()
+                        await c.read_body(hdr, put)
+                        c.close()
+                        break
+                    except (Aborted, ServerError):
+                        c.close()
+                        raise
+                    except Exception:
+                        c.close()
+                        if attempt == 4:
+                            raise
+                        suspect(best, "download")
+                        await asyncio.sleep(1)
+                        best = max(await wait_links(job), key=weight)
         else:
             n = (total + CHUNK - 1) // CHUNK
             queue = collections.deque(range(n))
@@ -1565,7 +2523,7 @@ async def run_download(job):
                     st, h = await conn.request(path, (start, end), hdrs())
                     if st != 206 or not h.get("content-range", "").startswith(f"bytes {start}-"):
                         conn.close()
-                        raise ConnectionError("range not honoured")
+                        raise ServerError(f"HTTP {st}" if st >= 400 else "range not honoured")
                     pos = [start]
 
                     def put(b):
@@ -1587,7 +2545,7 @@ async def run_download(job):
                 async def worker(l):
                     conn, fails = Conn(l, scheme, host, port), 0
                     try:
-                        while len(done_set) < n and job["state"] == "running":
+                        while len(done_set) < n and job["state"] == "running" and l["healthy"]:
                             i = pick(-1)
                             if i is None:
                                 await asyncio.sleep(0.2)
@@ -1599,6 +2557,18 @@ async def run_download(job):
                                 fails = 0
                             except Aborted:
                                 conn.close()  # someone else finished this piece first
+                            except ServerError as e:  # the server said no (expired link, too many connections)
+                                conn.close()
+                                server_errs.append(str(e))
+                                if i not in done_set:
+                                    if inflight.get(i, [0, 1])[1] <= 1:
+                                        inflight.pop(i, None)
+                                        queue.appendleft(i)
+                                    else:
+                                        inflight[i][1] -= 1
+                                await asyncio.sleep(2)
+                                if len(server_errs) >= 12:
+                                    break
                             except Exception:
                                 conn.close()
                                 fails += 1
@@ -1609,15 +2579,57 @@ async def run_download(job):
                                         queue.appendleft(i)
                                     else:
                                         inflight[i][1] -= 1
-                                if tries[i] > 8 or fails >= 4:
-                                    break  # this link is not working for this file: the others carry on
+                                if fails >= 3:
+                                    suspect(l, "download")
+                                if tries[i] > 30 or fails >= 4:
+                                    break  # this link is not working for this file now: the others carry on
                                 await asyncio.sleep(1)
                     finally:
                         conn.close()
 
-                await asyncio.gather(*(worker(l) for l in ls for _ in range(WORKERS_PER_LINK)))
+                crew = {}  # task -> link
+                server_errs = []
+
+                async def manage():
+                    """Keep WORKERS_PER_LINK workers on every working link, the whole time; wait out outages."""
+                    outage, died = None, {}
+                    seen_done, progress_at = job["done"], time.time()
+                    while len(done_set) < n and job["state"] == "running":
+                        if len(server_errs) >= 12:
+                            job["error_reason"] = "サーバーが断りました（" + server_errs[-1] + "） / the server refused"
+                            return
+                        if job["done"] != seen_done:
+                            seen_done, progress_at = job["done"], time.time()
+                        elif dl_links() and time.time() - progress_at > 600:
+                            job["error_reason"] = "10 分進みませんでした / no progress for 10 minutes"
+                            return
+                        for t in [t for t in crew if t.done()]:
+                            died[id(crew.pop(t))] = time.time()
+                        now_ls = dl_links()
+                        if not now_ls:
+                            outage = outage or time.time()
+                            job["waiting"] = True
+                            if time.time() - outage > DL_OUTAGE_MAX:
+                                return
+                        else:
+                            outage = None
+                            job["waiting"] = False
+                            for l in now_ls:
+                                if time.time() - died.get(id(l), 0) < 10:
+                                    continue  # its workers just gave up on this file: give it a moment
+                                have = sum(1 for x in crew.values() if x is l)
+                                for _ in range(WORKERS_PER_LINK - have):
+                                    crew[asyncio.ensure_future(worker(l))] = l
+                        await asyncio.sleep(1)
+
+                try:
+                    await manage()
+                finally:
+                    for t in crew:
+                        t.cancel()
+                    await asyncio.gather(*crew, return_exceptions=True)
             if len(done_set) < n and job["state"] == "running":
-                raise ConnectionError("途中で失敗しました / download failed part-way")
+                raise ConnectionError(job.get("error_reason") or "途中で失敗しました（回線が戻りませんでした） / download failed part-way")
         if job["state"] != "running":
             raise Aborted()
         os.replace(part, final)
@@ -1670,14 +2682,44 @@ class _MIB_IFROW(ctypes.Structure):
                 ("dwOutQLen", ctypes.c_ulong), ("dwDescrLen", ctypes.c_ulong), ("bDescr", ctypes.c_ubyte * 256)]
 
 
+class _GUID16(ctypes.Structure):
+    _fields_ = [("d", ctypes.c_ubyte * 16)]
+
+
+class _MIB_IF_ROW2(ctypes.Structure):  # netioapi.h; 1352 bytes on 64-bit Windows (checked)
+    _fields_ = [("InterfaceLuid", ctypes.c_uint64), ("InterfaceIndex", ctypes.c_ulong), ("InterfaceGuid", _GUID16),
+                ("Alias", ctypes.c_wchar * 257), ("Description", ctypes.c_wchar * 257),
+                ("PhysicalAddressLength", ctypes.c_ulong), ("PhysicalAddress", ctypes.c_ubyte * 32),
+                ("PermanentPhysicalAddress", ctypes.c_ubyte * 32), ("Mtu", ctypes.c_ulong), ("Type", ctypes.c_ulong),
+                ("TunnelType", ctypes.c_int), ("MediaType", ctypes.c_int), ("PhysicalMediumType", ctypes.c_int),
+                ("AccessType", ctypes.c_int), ("DirectionType", ctypes.c_int), ("Flags", ctypes.c_ubyte),
+                ("OperStatus", ctypes.c_int), ("AdminStatus", ctypes.c_int), ("MediaConnectState", ctypes.c_int),
+                ("NetworkGuid", _GUID16), ("ConnectionType", ctypes.c_int),
+                ("TransmitLinkSpeed", ctypes.c_uint64), ("ReceiveLinkSpeed", ctypes.c_uint64),
+                ("InOctets", ctypes.c_uint64), ("InUcastPkts", ctypes.c_uint64), ("InNUcastPkts", ctypes.c_uint64),
+                ("InDiscards", ctypes.c_uint64), ("InErrors", ctypes.c_uint64), ("InUnknownProtos", ctypes.c_uint64),
+                ("InUcastOctets", ctypes.c_uint64), ("InMulticastOctets", ctypes.c_uint64),
+                ("InBroadcastOctets", ctypes.c_uint64), ("OutOctets", ctypes.c_uint64), ("OutUcastPkts", ctypes.c_uint64),
+                ("OutNUcastPkts", ctypes.c_uint64), ("OutDiscards", ctypes.c_uint64), ("OutErrors", ctypes.c_uint64),
+                ("OutUcastOctets", ctypes.c_uint64), ("OutMulticastOctets", ctypes.c_uint64),
+                ("OutBroadcastOctets", ctypes.c_uint64), ("OutQLen", ctypes.c_uint64)]
+
+
 def read_octets(idx):
-    """(received, sent) byte counters of a network adapter as Windows counts them - ALL of the PC's traffic on it,
-    not only what goes through link-bond. 32-bit counters (they wrap; see sample_history). None if unknown."""
+    """(received, sent, link speed in bit/s) of a network adapter as Windows counts them - ALL of the PC's traffic
+    on it, not only what goes through link-bond. 32-bit counters (they wrap; see sample_history). None if unknown."""
+    try:  # 64-bit counters first (they never wrap: a counter that goes down was reset)
+        r2 = _MIB_IF_ROW2()
+        r2.InterfaceIndex = idx
+        if ctypes.sizeof(_MIB_IF_ROW2) == 1352 and ctypes.windll.iphlpapi.GetIfEntry2(ctypes.byref(r2)) == 0:
+            return r2.InOctets, r2.OutOctets, r2.ReceiveLinkSpeed, True
+    except Exception:
+        pass
     try:
         row = _MIB_IFROW()
         row.dwIndex = idx
         if ctypes.windll.iphlpapi.GetIfEntry(ctypes.byref(row)) == 0:
-            return row.dwInOctets, row.dwOutOctets
+            return row.dwInOctets, row.dwOutOctets, (0 if row.dwSpeed == 0xFFFFFFFF else row.dwSpeed)
     except Exception:
         pass
     return None
@@ -1709,10 +2751,20 @@ def sample_history(dt=HISTORY_SEC):
         if oc is not None:
             prev = _prev_octets.get(l["idx"])
             _prev_octets[l["idx"]] = oc
-            if prev is not None:  # counters are 32-bit: a wrap-around is handled by the modulo
-                down = round(((oc[0] - prev[0]) % (1 << 32)) * 8 / dt / 1e6, 2)
-                up = round(((oc[1] - prev[1]) % (1 << 32)) * 8 / dt / 1e6, 2)
-                both = round(down + up, 2)
+            wide = len(oc) > 3 and oc[3]
+            if prev is not None and wide and (oc[0] < prev[0] or oc[1] < prev[1]):
+                prev = None  # 64-bit counters only go down when the adapter was reset: not traffic
+            if prev is not None:  # 32-bit counters: a wrap-around is handled by the modulo
+                m = (1 << 64) if wide else (1 << 32)
+                d_ = round(((oc[0] - prev[0]) % m) * 8 / dt / 1e6, 2)
+                u_ = round(((oc[1] - prev[1]) % m) * 8 / dt / 1e6, 2)
+                # A reconnected adapter starts counting from 0 again; the modulo would read that as ~4 GB in one
+                # sample (17 000 Mbps). Faster than the adapter itself (or than anything) = a reset, not traffic.
+                speed = oc[2] / 1e6 if len(oc) > 2 and oc[2] else 0
+                limit = min(CAP_SANE_MBPS, max(speed * 1.5, 1000)) if speed else CAP_SANE_MBPS
+                if d_ <= limit and u_ <= limit:
+                    down, up = d_, u_
+                    both = round(down + up, 2)
         l["now_down"], l["now_up"] = down, up
         history.setdefault(k, collections.deque(maxlen=HISTORY_LEN)).append(both)
         hist_down.setdefault(k, collections.deque(maxlen=HISTORY_LEN)).append(down)
@@ -1771,6 +2823,7 @@ def status_dict():
             "now_down": l["now_down"], "now_up": l["now_up"],
             "via_down": l.get("via_down", 0.0), "via_up": l.get("via_up", 0.0),
             "rtt_ms": l["rtt"], "loss_pct": l["loss"], "quality": quality(l), "measuring": l["measuring"],
+            "suspect": l.get("suspect", False), "drops_today": stability_today(l)[0], "uptime_today": stability_today(l)[1],
             "checked_ago": round(now - l["ping_at"]) if l.get("ping_at") else None, "last_ok": l.get("ping_ok"),
             "best_at": (capacity.get(cap_key(l)) or {}).get("at") or None,
             "peak_down": max(hist_down.get(k) or [0]), "peak_up": max(hist_up.get(k) or [0]),
@@ -1778,6 +2831,7 @@ def status_dict():
         })
     return {
         "version": __version__, "update": dict(update_info) or None, "news": news(),
+        "last_open_age": round(time.time() - last_open_ok),
         "vpn_on": vpn_on, "vpn_present": vpn_present, "vpn_bypass": vpn_bypass,
         "bypass_exe": bypass_exe(), "upload_share": round(upload_share(), 2),
         "modes": {"eco": eco_on, "block": block_on, "power": power_on},
@@ -1804,7 +2858,7 @@ def _dl_view(j):
     secs = max(end - j["t0"], 0.5)
     tot = sum(j["by_link"].values()) or 1
     return {"id": j["id"], "name": j["name"] or j["url"], "state": j["state"], "error": j["error"], "size": j["size"],
-            "source": j.get("source", "manual"),
+            "source": j.get("source", "manual"), "waiting": bool(j.get("waiting")),
             "done": j["done"], "ranged": j["ranged"], "mbps": round(j["done"] * 8 / secs / 1e6, 1),
             "by_link": {k: round(v / tot * 100) for k, v in j["by_link"].items()}}
 
@@ -1838,6 +2892,18 @@ async def stats_server(cr, cw):
                     out = http_resp("200 OK", "text/html; charset=utf-8", f.read())
             except OSError:
                 out = http_resp("200 OK", "text/plain; charset=utf-8", status_json())
+        elif method == "GET" and path in ("/history", "/history.html"):
+            try:
+                with open(os.path.join(HERE, "history.html"), encoding="utf-8") as f:
+                    out = http_resp("200 OK", "text/html; charset=utf-8", f.read())
+            except OSError:
+                out = http_resp("404 Not Found", "text/plain", "history.html is missing")
+        elif method == "GET" and path.startswith("/api/history"):
+            q = urllib.parse.parse_qs(urllib.parse.urlsplit(path).query)
+            day = (q.get("day") or [time.strftime("%Y-%m-%d")])[0]
+            data = (await asyncio.to_thread(history_data, day)) or {"day": day, "days": history_days(), "devices": [],
+                                                                       "events": [], "nolink": []}
+            out = http_resp("200 OK", "application/json; charset=utf-8", json.dumps(data, ensure_ascii=False))
         elif method == "GET" and path == "/status.json":
             out = http_resp("200 OK", "application/json; charset=utf-8", status_json())
         elif method == "POST" and path == "/api/budget":
@@ -1902,6 +2968,14 @@ async def stats_server(cr, cw):
                         asyncio.create_task(measure_and_set(l, full=True))
                         l["measuring"] = True
                 out = http_resp("200 OK", "application/json; charset=utf-8", status_json())
+        elif method == "POST" and path == "/api/update":  # the box's "update" button
+            if hdr.get("x-linkbond") != "1":
+                out = http_resp("403 Forbidden", "text/plain", "forbidden")
+            else:
+                ok = await asyncio.to_thread(install_update) if update_info.get("version") else False
+                out = http_resp("200 OK", "application/json; charset=utf-8",
+                                json.dumps({"installed": ok, "url": update_info.get("url"),
+                                            "state": update_info.get("state"), "error": update_info.get("error")}))
         elif method == "POST" and path in ("/api/mode", "/api/quit"):
             n = int(hdr.get("content-length") or 0)
             if hdr.get("x-linkbond") != "1" or not 0 <= n <= 1000:
@@ -1934,7 +3008,7 @@ async def stats_server(cr, cw):
 
 # ---------- updates: a new version put on disk is picked up by itself and announced ----------
 SELF_FILE = None if getattr(sys, "frozen", False) else os.path.abspath(__file__)
-update_info = {}  # {"version", "url"} when a newer published release exists
+update_info = {}  # {"version", "url", "zip", "auto", "state", "error"} when a newer release exists
 
 
 def file_version(path):
@@ -2012,6 +3086,28 @@ def mark_news_seen():
         pass
 
 
+async def confirm_update():
+    """The new version has run fine for 2 minutes: the supervisor must not roll it back any more."""
+    await asyncio.sleep(120)
+    confirm_pending(HERE)
+
+
+def confirm_pending(here):
+    """Remove the roll-back marker - only when it is about THIS version (an older process must not remove the
+    marker of a version it just installed)."""
+    p = os.path.join(here, "update-pending.json")
+    try:
+        with open(p, encoding="utf-8") as f:
+            to = json.load(f).get("to")
+        if to and vtuple(to) == vtuple(__version__):
+            os.remove(p)
+            log(f"update to {__version__} confirmed")
+            return True
+    except (OSError, ValueError, AttributeError):
+        pass
+    return False
+
+
 async def self_update_loop():
     """bond.py replaced on disk (a new version): restart into it - the supervisor (run.ps1) starts it again within
     seconds; meanwhile the PC simply uses its normal connection. A file that does not compile is left alone."""
@@ -2040,6 +3136,10 @@ async def self_update_loop():
         if not supervised():
             log("new bond.py found, but nothing would restart link-bond - restart it yourself to update")
             continue
+        for _ in range(180):  # a download over all links is not cut by the restart (waits up to 30 minutes)
+            if not any(j.get("state") == "running" for j in downloads.values()):
+                break
+            await asyncio.sleep(10)
         log(f"new version on disk ({__version__} -> {file_version(SELF_FILE)}): restarting into it")
         save_usage()
         save_capacity()
@@ -2047,38 +3147,266 @@ async def self_update_loop():
 
 
 def check_release():
-    """The newest published release of UPDATE_REPO: (version, url) or None. Plain HTTPS, no proxy."""
+    """The newest published release of UPDATE_REPO: (version, page url, source zip url, passed the tests) or None.
+    'Passed the tests' = the release build (which runs selftest.py first) attached its zip. HTTPS, no proxy."""
     req = urllib.request.Request(f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest",
                                  headers={"User-Agent": "link-bond", "Accept": "application/vnd.github+json"})
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     with opener.open(req, timeout=15) as r:
         data = json.loads(r.read().decode())
     tag = str(data.get("tag_name", "")).lstrip("vV")
-    return (tag, data.get("html_url", "")) if tag else None
+    tested = any(str(a.get("name", "")).startswith("link-bond-windows-exe") for a in data.get("assets") or [])
+    return (tag, data.get("html_url", ""), data.get("zipball_url", ""), tested) if tag else None
+
+
+# What an update may write: the program files only. Settings, usage, capacity, *.local.txt, logs stay as they are.
+UPDATE_TOP = {"bond.py", "widget.pyw", "dashboard.html", "history.html", "repair.ps1", "install-repair.ps1", "selftest.py", "run.ps1", "stop.ps1", "open.ps1",
+              "proxy.ps1", "start-hidden.ps1", "install.ps1", "keep-connected.ps1", "install.bat", "uninstall.bat",
+              "eco.txt", "blocklist.txt", "pinned.txt", "CHANGELOG.md", "README.md", "README.ja.md", "LICENSE"}
+UPDATE_DIRS = ("browser-extension/", "docs/")
+UPDATE_MAX_BYTES = 30_000_000
+WIN_RESERVED = re.compile(r"^(con|prn|aux|nul|com\d|lpt\d)(\..*)?$", re.I)
+
+
+def update_blocker():
+    """Why this copy cannot replace its own files ('' = it can)."""
+    if SELF_FILE is None:
+        return "exe"  # the packaged .exe cannot swap itself: the release page is opened instead
+    if os.path.isdir(os.path.join(HERE, ".git")):
+        return "git"  # a developer's working copy: never overwrite it with a download
+    return ""
+
+
+def update_members(names):
+    """Map the files of a GitHub source zip ("owner-repo-sha/path") to the paths an update may write."""
+    out = {}
+    for n in names:
+        if n.endswith("/") or "/" not in n:
+            continue
+        rel = n.split("/", 1)[1]
+        parts = rel.split("/")
+        if not rel or any(x in ("", ".", "..") or x[-1] in ". " or WIN_RESERVED.match(x) for x in parts) \
+                or ":" in rel or "\\" in rel:
+            continue
+        if rel in UPDATE_TOP or (rel.startswith(UPDATE_DIRS) and len(parts) == 2):
+            out[n] = rel
+    return out
+
+
+def apply_update(blob, version, here=None):
+    """Put a downloaded release (GitHub source zip) in place. Checks first, writes after; bond.py goes last,
+    because writing it makes the running link-bond restart into the new version (the box restarts by itself too).
+    The replaced files are kept in update-backup/. Returns the written paths; raises ValueError when unusable."""
+    here = here or HERE
+    if len(blob) > UPDATE_MAX_BYTES:
+        raise ValueError("download too big")
+    try:
+        with zipfile.ZipFile(io.BytesIO(blob)) as z:
+            files = {rel: z.read(n) for n, rel in update_members(z.namelist()).items()}
+    except zipfile.BadZipFile as e:
+        raise ValueError(f"not a zip file: {e}")
+    if "bond.py" not in files or "widget.pyw" not in files:
+        raise ValueError("not a link-bond release")
+    for name in ("bond.py", "widget.pyw", "selftest.py"):
+        if name in files:
+            try:
+                compile(files[name].decode("utf-8"), name, "exec")
+            except (SyntaxError, UnicodeDecodeError, ValueError) as e:
+                raise ValueError(f"{name} is broken: {e}")
+    m = re.search(rb'^__version__ = "([^"]+)"', files["bond.py"], re.M)
+    if not m or vtuple(m.group(1).decode()) != vtuple(version):
+        raise ValueError("the download is not the announced version")
+    backup = os.path.join(here, "update-backup")
+
+    def same(rel):
+        try:
+            with open(os.path.join(here, *rel.split("/")), "rb") as f:
+                return f.read() == files[rel]
+        except OSError:
+            return False
+    files = {rel: data for rel, data in files.items() if not same(rel)}  # unchanged files are left alone
+    if os.path.isdir(backup):  # one generation: the version that is running now
+        shutil.rmtree(backup, ignore_errors=True)
+    order = sorted(files, key=lambda r: {"bond.py": 1, "proxy.ps1": 2, "run.ps1": 3}.get(r, 0))  # these last
+    # The supervisor (run.ps1) puts update-backup/ back if the new version keeps dying right after start;
+    # a new version that runs fine for a while removes this marker (confirm_update).
+    with open(os.path.join(here, "update-pending.json"), "w", encoding="utf-8") as f:
+        json.dump({"to": version, "files": order, "at": time.time()}, f)
+    written, created = [], []
+    try:
+        for rel in order:
+            dst = os.path.join(here, *rel.split("/"))
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            if os.path.exists(dst):
+                b = os.path.join(backup, *rel.split("/"))
+                os.makedirs(os.path.dirname(b), exist_ok=True)
+                with open(dst, "rb") as f_in, open(b, "wb") as f_out:
+                    f_out.write(f_in.read())
+            else:
+                created.append(rel)
+            tmp = dst + ".new"
+            with open(tmp, "wb") as f:
+                f.write(files[rel])
+            for attempt in range(5):  # a virus scanner or the indexer may hold the file for a moment
+                try:
+                    os.replace(tmp, dst)
+                    break
+                except PermissionError:
+                    if attempt == 4:
+                        raise
+                    time.sleep(1)
+            written.append(rel)
+    except Exception:
+        # never leave a mix of old and new files: put back what was replaced, remove what was added
+        for rel in written:
+            dst = os.path.join(here, *rel.split("/"))
+            try:
+                if rel in created:
+                    os.remove(dst)
+                else:
+                    shutil.copyfile(os.path.join(backup, *rel.split("/")), dst)
+            except OSError:
+                pass
+        try:
+            os.remove(os.path.join(here, "update-pending.json"))
+        except OSError:
+            pass
+        raise
+    return written
+
+
+def download(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "link-bond"})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(req, timeout=120) as r:
+        return r.read(UPDATE_MAX_BYTES + 1)
+
+
+_install_lock = threading.Lock()
+
+
+def install_update():
+    """Download and put in place the release in update_info. True when the files are (already) replaced.
+    Only one at a time: the automatic install and the box's button cannot overlap or repeat."""
+    if not _install_lock.acquire(blocking=False):
+        update_info["error"] = None
+        return False  # one is running right now (its state shows "installing")
+    try:
+        if update_info.get("state") == "installed":
+            return True
+        v, src = update_info.get("version"), update_info.get("zip")
+        why = update_blocker()
+        if not update_info.get("tested"):
+            update_info["error"] = "the tests of this release have not passed yet - try again later"
+            return False
+        if why == "git" and v:
+            ok, msg = git_pull()
+            log("update via git pull:", "ok" if ok else msg)
+            if ok:
+                update_info["state"], update_info["error"] = "installed", None
+            else:  # local changes (a developer copy): leave it to them - the page button, no retries
+                update_info["state"], update_info["error"], update_info["auto"] = None, msg, False
+            return ok
+        if not v or not src or why:
+            update_info["error"] = {"exe": "this is the .exe build: download the new zip from the page",
+                                    "git": "developer copy (git): update with git pull"}.get(why, "nothing to install")
+            return False
+        update_info["state"], update_info["error"] = "installing", None
+        try:
+            written = apply_update(download(src), v)
+        except Exception as e:
+            update_info["state"], update_info["error"] = "failed", f"{type(e).__name__}: {e}"[:200]
+            log("update failed:", update_info["error"])
+            return False
+        update_info["state"] = "installed"
+    finally:
+        _install_lock.release()
+    log(f"update {__version__} -> {v}: {len(written)} files replaced (old ones in update-backup)")
+    if not supervised():
+        notify(f"link-bond {v} を入れました / installed",
+               "デスクトップの「回線まとめ」を開き直すと新しい版になります。\nReopen link-bond to finish.")
+    return True
+
+
+def git_pull():
+    """A git copy (like the developer's PC) is updated with `git pull --ff-only` - only when nothing is changed
+    locally, so no work is ever overwritten. (True, '') or (False, why)."""
+    def git(*a):
+        return subprocess.run(["git", "-C", HERE] + list(a), capture_output=True, timeout=120, creationflags=0x08000000)
+    try:
+        st = git("status", "--porcelain", "--untracked-files=no")
+        if st.returncode != 0:
+            return False, "git is not usable here"
+        if st.stdout.strip():
+            return False, "local changes in the git copy: not pulling"
+        r = git("pull", "--ff-only")
+        return (r.returncode == 0), r.stderr.decode("utf-8", "replace").strip()[:150]
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, type(e).__name__
+
+
+def skipped_version():
+    try:
+        return open(state_path("update-skip.txt"), encoding="utf-8").read().strip()
+    except OSError:
+        return ""
+
+
+RELEASE_CHECK_SEC = 6 * 3600
+first_seen = {}  # version -> when this run first saw it published
+
+
+def busy_now():
+    """Connections carrying data in the last 20 s (an update restart would cut them)."""
+    now = time.time()
+    return sum(1 for r in live.values() if now - r.get("t_data", 0) < 20) >= 1
 
 
 async def release_loop():
-    """Once a day: is there a newer published version? Tell once per version."""
+    """At start and every 6 hours: is there a newer published version? It is downloaded and put in place by
+    itself (the running link-bond and the box then restart into it). Where that is not possible (the .exe,
+    a developer's git copy) you are told once per version and the box offers the download page."""
     if not UPDATE_REPO:
         return
+    await asyncio.sleep(20)  # let the links come up first
     while True:
+        wait = RELEASE_CHECK_SEC
         try:
             rel = await asyncio.to_thread(check_release)
-            if rel and vtuple(rel[0]) > vtuple(__version__):
-                update_info.update(version=rel[0], url=rel[1])
-                p = state_path("update-notified.txt")
-                try:
-                    told = open(p, encoding="utf-8").read().strip()
-                except OSError:
-                    told = ""
-                if told != rel[0]:
-                    notify(f"link-bond の新しい版 {rel[0]} があります / update available",
-                           f"いまは {__version__}。小さな箱の「新しい版」から入れられます。\n{rel[1]}")
-                    with open(p, "w", encoding="utf-8") as f:
-                        f.write(rel[0])
+            have = (SELF_FILE and file_version(SELF_FILE)) or __version__  # already installed, not restarted yet
+            if rel and vtuple(rel[0]) > vtuple(have):
+                if update_info.get("version") != rel[0]:
+                    update_info.clear()
+                update_info.update(version=rel[0], url=rel[1], zip=rel[2], tested=rel[3],
+                                   auto=update_blocker() in ("", "git"))
+                if rel[0] == skipped_version():  # this version was rolled back: wait for the next one
+                    update_info["auto"] = False
+                if update_info["auto"] and not rel[3]:
+                    log(f"new version {rel[0]} published, its tests have not passed yet: waiting")
+                    wait = 1800
+                elif update_info["auto"] and any(j.get("state") == "running" for j in downloads.values()):
+                    wait = 600  # do not restart in the middle of a download: try again in 10 minutes
+                elif update_info["auto"] and busy_now() and time.time() - first_seen.setdefault(rel[0], time.time()) < 6 * 3600:
+                    wait = 600  # people are using the internet right now: install at a quiet moment (at most 6 h later)
+                elif update_info["auto"]:
+                    log(f"new version {rel[0]} published: installing it")
+                    if not await asyncio.to_thread(install_update) and update_info.get("auto"):
+                        wait = 1800
+                else:
+                    p = state_path("update-notified.txt")
+                    try:
+                        told = open(p, encoding="utf-8").read().strip()
+                    except OSError:
+                        told = ""
+                    if told != rel[0]:
+                        notify(f"link-bond の新しい版 {rel[0]} があります / update available",
+                               f"いまは {__version__}。小さな箱の「更新する」でページが開きます。\n{rel[1]}")
+                        with open(p, "w", encoding="utf-8") as f:
+                            f.write(rel[0])
         except Exception as e:
-            log("update check failed:", type(e).__name__)
-        await asyncio.sleep(86400)
+            log("update check failed:", type(e).__name__, str(e)[:120])
+            wait = 1800  # no internet yet, GitHub busy ...: try again in 30 minutes
+        await asyncio.sleep(wait)
 
 
 port_servers = []
@@ -2094,7 +3422,13 @@ async def serve(port=1080, stats_port=1081, discover=True):
         asyncio.create_task(refresh_loop())
         asyncio.create_task(health_loop())
         asyncio.create_task(self_update_loop())
+        asyncio.create_task(confirm_update())
+        if sys.platform == "win32":
+            asyncio.create_task(wifi_loop())
+            asyncio.create_task(repair_loop())
         asyncio.create_task(release_loop())
+    global link_back
+    link_back = asyncio.Event()
     srv = await asyncio.start_server(handle, "127.0.0.1", port)
     st = await asyncio.start_server(stats_server, "127.0.0.1", stats_port) if stats_port else None
     port_servers.clear()
@@ -2113,10 +3447,27 @@ async def main(args):
     load_labels()
     load_budget()
     load_capacity()
+    load_stability()
     load_eco()
     load_blocklist()
     load_ports()
     announce_version()
+    rb = os.path.join(HERE, "update-rolled-back.txt")
+    if os.path.exists(rb):  # the supervisor put the previous version back (the new one kept dying)
+        try:
+            bad = open(rb, encoding="utf-8-sig").read().split()[-1]
+            with open(state_path("update-skip.txt"), "w", encoding="utf-8") as f:
+                f.write(bad)
+        except (OSError, IndexError):
+            pass
+        notify("link-bond: 新しい版が動かなかったので元に戻しました / update rolled back",
+               f"いまは {__version__} で動いています。次の版が出たら、また自動で入れ替えます。\n"
+               f"The new version kept failing; running {__version__} again.")
+        add_event(f"更新を元に戻しました（{__version__}） / update rolled back")
+        try:
+            os.remove(rb)
+        except OSError:
+            pass
     srv, _ = await serve(args.port, args.stats_port)
     extra = f", per-device ports: {dict(ports_map)}" if ports_map else ""
     log(f"link-bond {__version__} listening on 127.0.0.1:{args.port} (SOCKS5 + HTTP), dashboard: http://127.0.0.1:{args.stats_port}{extra}")

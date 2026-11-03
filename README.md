@@ -12,11 +12,14 @@ One small floating box does everything. Under it is a tiny local proxy (one Pyth
 * **Low-quality video mode (ON by default)** - videos are slowed to about 2.5 Mbps in total, so players drop to a lower quality by themselves (~480p). Data use falls a lot.
 * **Downloads over ALL links** - with the included Chrome extension every download is handed to link-bond, which fetches ONE file from every connection at once, so a single big file really gets the sum of your links. You can also paste a URL in the box.
 * **All links at once** - every connected link is used at the same time, each in proportion to its speed. Browsers, parallel downloads and several uploads add up to the sum of the links.
-* **Some links drop, the rest carry on at full speed** - connections stuck on a dead link are moved to the working ones at once, a dead link is skipped in seconds, and every change is reported ("Phone B: CUT - carrying on with 1").
+* **Built for unstable links** - a new connection that does not get through on the first link within ~2x its answer time (0.25-1.5 s) is raced on the next one; a link that misses a check is re-checked every 2.5 s and dropped in ~8 s; a cut link is checked every 5 s and used again at once (gently for 60 s, and less if it keeps dropping); names are looked up over every link at once with a last-known fallback; when every link is cut, new connections wait up to 15 s for one to come back. Blips under 20 s are recorded, not notified.
 * **Prepaid balance you can see** - type what your carrier says is left; link-bond subtracts what this PC uses and warns at 80 / 95 / 100 %. Top up with one click.
 * **Alerts** - a Windows notification when a phone loses the internet (with a hint when it looks like the prepaid credit ran out), when Windows silently joined another Wi-Fi, when a phone keeps dropping, plus a daily "yesterday you used ..." report.
-* **Ad / tracker blocking** (optional) and a full **dashboard** at <http://127.0.0.1:1081>.
+* **Ad / tracker blocking** (optional). For more numbers, open "Dashboard" from the box menu (a page on your own PC, only while link-bond is running).
 * If link-bond ever dies the system proxy is removed within seconds: **your internet never stays broken.**
+* **A phone hotspot that drops is joined again by itself** (Windows gives up after a few tries).
+* **A full connection record** (`connlog` folder, one file per day, 14 days) and a page to read it: **Connection record** in the box (http://127.0.0.1:1081/history) shows per link when it dropped, answer times, time with no link at all, and the page that answered instead of the internet (out of data ...).
+* **Auto-repair**: run `install-repair.ps1` once (one administrator prompt). Then a link that does not answer for 90 s, an adapter left without an address, or a Wi-Fi that will not rejoin gets that one adapter restarted (at most every 10 minutes and 12 times a day per adapter), and phone hotspots you used are found even while the phone hides their name. Undo: delete the task `link-bond-repair` and `C:\ProgramData\link-bond-repair`.
 
 ## The small box
 
@@ -38,7 +41,7 @@ Closing the box (✕) only hides it - click the desktop icon to bring it back. "
 | | |
 |---|---|
 | **One ordinary connection = one link.** | A browser tab or one streamed video still runs at the speed of one link. Gains appear when many connections run together - and for a single file with *Fast download*. Real packet-level bonding (what Speedify sells) needs a paid server that re-assembles the packets; link-bond deliberately has none, so it is free and nothing leaves your PC except your own traffic. |
-| **Fast download needs Range support.** | Most servers have it. Without it the file comes over the best single link. It is for files you download on purpose (paste the URL), not for what a browser fetches by itself. |
+| **Fast download needs Range support.** | Most servers have it. Without it the file comes over the best single link. With the Chrome extension, Chrome's downloads use it automatically (not page loads or videos). |
 | **Your links must be real alternatives.** | Different phones / SIMs / ISPs. Two connections of the same phone are one link. |
 | **Every link works all the time.** | All connected links are used at once, each in proportion to its speed (a link 10x slower gets about 1/10 of the connections). When one drops, the others carry everything; when it comes back it joins again. A phone hotspot that other devices share will be busier, too. |
 | **The carrier's real balance cannot be read from a PC.** | You type the starting amount; link-bond counts only what *this PC* sends and receives over that device. Correct it any time. |
@@ -95,7 +98,7 @@ Split tunneling does not solve it: when you exclude link-bond (`linkbond.exe`, a
 ## How it chooses a link
 
 * **What a link can do costs (almost) no data to know.** Its capacity is the best speed it really reached in normal use (Windows' adapter counters, every 2 s), remembered per device and network in `capacity.json`; an old best fades to half in 3 days. Only a link nobody knows yet gets one small test (~0.4 MB); a full test (~3.2 MB per link, `speed.cloudflare.com`) runs only when you press **Measure speed** (or with `--remeasure-hours`).
-* **Its condition** comes from a tiny DNS question every 15 s (response time, loss: ~1.2 MB a day per link) and an HTTP check every 2 minutes that also spots a prepaid "out of credit" page (~0.5 MB a day). Three failed checks = cut (~45 s).
+* **Its condition** comes from a tiny DNS question every 15 s (response time, loss: ~1.2 MB a day per link) and an HTTP check every 2 minutes that also spots a prepaid "out of credit" page (~0.5 MB a day). A missed check starts re-checks every 2.5 s; three misses in a row = cut (~8 s).
 * **Red means a problem.** The pill turns red with the problem's name on anything wrong (a cut link, stopped tethering, an unstable link, a VPN stopping the bond ...); the big view paints only the affected line red (a merely slow link is yellow).
 * New connections go to the link with the least work per Mbps. While you mostly upload, upload speed counts more.
 * Hosts in `pinned.txt` (banks, Google / Facebook logins ...) always use the same link, so a login does not see your IP change.
@@ -103,7 +106,7 @@ Split tunneling does not solve it: when you exclude link-bond (`linkbond.exe`, a
 
 ## Updates
 
-Put a new version of the files in the folder (or `git pull`): within ~15 s link-bond and the small box restart into it by themselves (a file that does not run is ignored), and a notification says what changed (from `CHANGELOG.md`). A published build (`UPDATE_REPO` in `bond.py`) also checks once a day (~5 KB) whether a newer release exists, notifies you once and shows a **Get** button in the box.
+Put a new version of the files in the folder (or `git pull`): within ~15 s link-bond and the small box restart into it by themselves (a file that does not run is ignored), and a notification says what changed (from `CHANGELOG.md`). It also checks GitHub at start and every 6 hours (~5 KB) for a newer release. When one is out (and its tests passed), it is **downloaded (~150 KB) and installed by itself** - only the program files; your settings, balances and `*.local.txt` lists are kept, and the old files go to `update-backup/`. If the new version keeps failing right after start, the previous one is put back automatically. It installs at a quiet moment (waiting up to 6 hours while you use the internet) and never during a link-bond download. The **Update** button in the box installs it at once. A `git` copy is updated with `git pull` when it has no local changes, otherwise it is left alone and gets a button to the release page; the `.exe` build gets that button too. Versions up to 1.5.0 could not check for updates: install 1.5.1 by hand once, then restart Windows (or sign in again).
 
 ## Config files (all optional, all private - never published)
 
