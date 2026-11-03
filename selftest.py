@@ -481,6 +481,7 @@ def unit():
     check("record: events and log lines go to the connection record (connlog/day.jsonl)",
           any(r["kind"] == "event" and r["text"] == "test event" for r in rec) and any(r["kind"] == "log" for r in rec))
     check("changelog: what changed in this version is found", len(bond.changelog_head(bond.__version__)) > 5)
+    check("changelog: the notice has no markdown marks", "**" not in bond.changelog_head(bond.__version__))
     vf = os.path.join(bond.STATE_DIR, "version.txt")
     if os.path.exists(vf):
         os.remove(vf)

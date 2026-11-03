@@ -3033,7 +3033,7 @@ def changelog_head(version):
     except OSError:
         return ""
     m = re.search(r"^## " + re.escape(version) + r"[^\n]*\n(.*?)(?=^## |\Z)", text, re.M | re.S)
-    items = [x.strip().lstrip("-* ").split(" / ")[0] for x in (m.group(1).splitlines() if m else []) if x.strip()]
+    items = [x.strip().lstrip("-* ").split(" / ")[0].replace("**", "").rstrip(":： ") for x in (m.group(1).splitlines() if m else []) if x.strip()]
     return "\n".join(items[:4])
 
 
