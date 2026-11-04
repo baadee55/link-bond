@@ -63,6 +63,15 @@ To try it without the icon: `python bond.py` and point an application at `127.0.
 
 With the Chrome extension every download started in Chrome goes to link-bond automatically (the browser's cookies, referer and user agent come along, so most logged-in downloads work too). Without it: `▾ More` → Download → paste a URL → **Get**. The file is cut into 1 MB pieces; every link keeps taking the next piece, so a fast link carries more and a slow one fewer, and near the end idle links repeat pieces that a slow link is still working on. The finished file appears in your Downloads folder (never overwrites an existing file); the box shows the share each link carried. Only public `http(s)` URLs are accepted.
 
+## One connection over all links (relay, optional)
+
+Without help from the other side, one connection (one video, one download, one upload) can only use one link:
+every link has its own public address. With a **relay** - a small Cloudflare Worker you deploy yourself (free plan
+is enough, see [relay/README.md](relay/README.md)) - link-bond cuts big transfers into pieces, sends them over all
+links at the same time and the relay puts them back together. One download then gets close to the sum of the links,
+and it keeps going when a link drops in the middle. Only download hosts and hosts that moved a lot of data before
+are sent this way; login sites and sites hosted on Cloudflare stay direct. Turn it on with `relay.local.txt`.
+
 ## How to add a 3rd, 4th ... link
 
 There is no limit in link-bond: every adapter with an IPv4 address and a default route is found by itself, within ~10 s, with no setup. What limits you is hardware:
