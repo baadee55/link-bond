@@ -1,0 +1,13 @@
+{
+  "name": "link-bond-relay",
+  "main": "worker.js",
+  "compatibility_date": "2026-05-01",
+  "workers_dev": false,
+  "preview_urls": false,
+  // Fill in the real custom domain at deploy time (keep it out of this repo):
+  // "routes": [{ "pattern": "relay.example.com", "custom_domain": true }],
+  "durable_objects": {
+    "bindings": [{ "name": "FLOW", "class_name": "Flow" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Flow"] }]
+}

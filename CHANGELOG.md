@@ -1,5 +1,13 @@
 # 更新履歴 / Changelog
 
+## 1.6.0
+- **1 本の通信を全部の回線で同時に運ぶ（本当の束ね）** / one connection over ALL links at once:
+- 大きいダウンロード・アップロードを細かく切って全回線に同時に流し、中継（自分の Cloudflare Worker）で 1 本に組み直す。1 本のダウンロードでも回線の合計に近い速さ / a single download or upload gets close to the sum of the links
+- 速い回線に詰め、遅い回線には「その方が先に届く」時だけ載せる。ひどい回線が混ざっても、速い回線 1 本より遅くならない / a bad link never slows the good one
+- 途中で回線が切れても通信は止まらず、残りの回線で続く。全部の回線が 10 秒消えても続きから / survives a link dying mid-transfer, even all links gone for 10 s
+- 中継は自分で置く（relay/ と relay/README.md）。設定は relay.local.txt。無ければ今までどおり / bring your own relay; without it nothing changes
+- 束ねるのは、ダウンロード用のサイトと、大きく流れたことのあるサイト（そのホスト名だけ）。ログイン用のサイト・Cloudflare 上のサイトは束ねない / only bulk hosts; login sites and sites behind Cloudflare stay direct
+
 ## 1.5.1
 - **不安定な回線のための作り直し** / rebuilt for unstable links:
 - 名前（DNS）を全部の回線で同時に引く。Windows の回線が切れても名前が引け、何も答えない時は前に引いた住所を使う / names are looked up over every link at once, with a last-known fallback

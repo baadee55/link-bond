@@ -41,3 +41,11 @@ wifi.json
 update-skip.txt
 supervisor.log
 stability.json
+relay.local.txt
+bulk.local.txt
+bulk-learned.json
+cf-ips.json
+relay/.dev.vars
+relay/.wrangler/
+relay/node_modules/
+relay/READY

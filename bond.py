@@ -10,10 +10,13 @@ Windows 10/11, Python 3.9+, standard library only.
 """
 import argparse
 import asyncio
+import base64
 import collections
 import concurrent.futures
 import ctypes
 import fnmatch
+import hashlib
+import hmac
 import io
 import ipaddress
 import json
@@ -31,7 +34,7 @@ import urllib.parse
 import urllib.request
 import zipfile
 
-__version__ = "1.5.1"
+__version__ = "1.6.0"
 UPDATE_REPO = "baadee55/link-bond"  # newer releases on GitHub are installed by themselves (checked every 6 h, ~5 KB)
 
 HERE = os.path.dirname(sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__))  # next to the .exe
@@ -1978,12 +1981,24 @@ async def open_via(host, port, only=None):
         raise PermissionError("blocked: " + host)
     deadline = time.time() + HOLD_SEC
     last = None
+    bond_tried = only is not None  # a device's own port never goes through the relay
     while True:
         try:
             ip = await resolve(host, port)
         except ConnectionError as e:
             last = e
             ip = None
+        if ip and not bond_tried:
+            bond_tried = True  # once per connection, not on every hold-and-retry round
+            if bondable(host, port, ip):
+                try:
+                    r, w = await open_bonded(host, port)
+                    BOND_LINK["active"] += 1
+                    BOND_LINK["total"] += 1
+                    last_open_ok = time.time()
+                    return BOND_LINK, r, w
+                except ConnectionError:
+                    pass  # the relay did not work out: the normal path below, at once
         cands = candidates(host, only) if ip else []
         if ip and not cands and only is not None:
             raise ConnectionError(f"link {only!r} is not available")
@@ -2135,6 +2150,7 @@ async def pipe(r, w, link, kind, rule=None, rec=None):
             w.write(b)
             if rec is not None:
                 rec["t_data"] = time.time()
+                rec["n_" + kind] = rec.get("n_" + kind, 0) + len(b)  # (a very big one marks the host as bulk)
             link["bytes"] += len(b)
             link["b_" + kind] += len(b)
             if kind == "down":
@@ -2165,11 +2181,1241 @@ async def tunnel(cr, cw, link, sr, sw, first_data=b"", host=""):
     finally:
         live.pop(token, None)
         link["active"] -= 1
+        learn_from(rec, link, host)
         for w in (sw, cw):
             try:
                 w.close()
             except Exception:
                 pass
+
+
+# ---------- one connection over all links (relay) ----------
+# A big transfer (a video, a download, an upload) normally runs over ONE link. Here it is cut into pieces, the
+# pieces go over EVERY link to a small relay on Cloudflare, are put back together there and go on to the site from
+# one place - and the same in the other direction. So a single connection gets about the SUM of all links.
+# The rules of the pieces (frames, signature, scheduler) are in relay/README.md. relay.local.txt switches it on:
+#   line 1 = relay address (wss://...), line 2 = the shared secret. The file is never published or logged.
+RELAY_FILE = "relay.local.txt"
+BULK_FILE = "bulk.local.txt"        # your own extra hosts that are worth bonding (one per line)
+LEARNED_FILE = "bulk-learned.json"  # hosts that moved >= 8 MB in one connection (learned by itself)
+CF_FILE = "cf-ips.json"             # Cloudflare's own address ranges (a site behind Cloudflare cannot be reached by the relay)
+BOND_OPEN_SEC = 6.0                 # the relay must say OK within this time, else the normal path is used
+BOND_IDLE_SEC = 45                 # a bonded connection with no data either way is closed (the relay costs while open)
+BOND_HOST_BAD_SEC = 600             # a host the relay failed to reach is not bonded for this long
+BOND_RELAY_OFF_SEC = 600            # the relay itself refusing us (HTTP error, quota ...): off for this long
+BOND_NET_OFF_SEC = 60               # relay not reachable at all: a short pause (so no connection waits 6 s each)
+LEARN_BYTES = 8_000_000
+LEARN_KEEP_SEC = 30 * 86400
+LEARN_MAX = 500
+CF_REFRESH_SEC = 86400
+# Video sites are left out until checked through the relay: their stream links can be tied to the address that
+# opened the page. (Low-quality mode caps them anyway.) Add them in bulk.local.txt to try.
+BULK_BUILTIN = ("akamaized.net", "dl.google.com", "gvt1.com", "steamcontent.com",
+                "download.microsoft.com", "githubusercontent.com", "objects.githubusercontent.com")
+NO_RELAY_PORTS = (25, 465, 587)
+SECOND_LEVEL = {"co", "com", "ne", "or", "ac", "go", "gr", "ad", "net", "org", "gov", "edu"}  # co.jp, com.au ...
+
+# frame types (every WebSocket binary message is exactly one frame; numbers are big-endian)
+T_DATA, T_ACK, T_FIN, T_ERR, T_OK, T_PING, T_PONG = 1, 2, 3, 4, 5, 6, 7
+# scheduler numbers (the relay uses the same rule for the other direction)
+MIN_WIN, MAX_WIN = 64 << 10, 16 << 20
+MIN_CHUNK, MAX_CHUNK = 4 << 10, 64 << 10
+RATE_INIT, RATE_FLOOR = 1 << 20, 8 << 10
+MAX_BOND_LINKS = 16
+BOND_TOTAL_CAP = 24 << 20      # never more than this unacked in total (the relay keeps 32 MiB of out-of-order data)
+BOND_REORDER_MAX = 32 << 20
+BOND_PAUSE_HIGH, BOND_PAUSE_LOW = 8 << 20, 2 << 20  # the app reads slowly: stop acknowledging until it caught up
+BOND_DRAIN_HIGH = 512 << 10
+WS_BUF = 128 << 10
+WS_MAX_MSG = 4 << 20
+WS_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+BOND_LINK = new_link(None, "bonded", None)  # tunnel()/pipe() take this as "the link" of a bonded connection
+bond_stats = {"bytes": 0}   # payload carried through the relay (each byte once)
+bond_flows = set()          # the flows that are open right now
+relay_off_until, relay_why = 0.0, None
+host_bad = {}               # host -> time until which it is not bonded (the relay could not reach it)
+learned_bulk = {}           # registered domain -> last seen
+cf_nets = None              # Cloudflare ranges (None = not known yet: nothing is bonded)
+cf_state = {"at": 0.0, "tried": 0.0}  # when the list was fetched / when we last looked for the file
+_relay_cache = {"key": None, "cfg": None}
+_bulk_cache = {"key": None, "pats": ()}
+_learned_loaded = [False]
+
+
+# ----- settings -----
+def relay_cfg():
+    """The relay address and secret from relay.local.txt (None = feature off). Read again when the file changes."""
+    p = state_path(RELAY_FILE)
+    try:
+        st = os.stat(p)
+        key = (p, st.st_mtime_ns, st.st_size)
+    except OSError:
+        _relay_cache.update(key=None, cfg=None)
+        return None
+    if _relay_cache["key"] == key:
+        return _relay_cache["cfg"]
+    cfg = None
+    try:
+        with open(p, encoding="utf-8-sig") as f:
+            lines = [x.strip() for x in f.read().splitlines() if x.strip() and not x.strip().startswith("#")]
+        u = urllib.parse.urlsplit(lines[0])
+        secret = bytes.fromhex(lines[1])
+        if u.scheme in ("ws", "wss") and u.hostname and len(secret) >= 16:
+            tls = u.scheme == "wss"
+            cfg = dict(host=u.hostname, port=u.port or (443 if tls else 80), tls=tls, base=u.path.rstrip("/"),
+                       secret=secret)
+    except (OSError, ValueError, IndexError):
+        cfg = None
+    _relay_cache.update(key=key, cfg=cfg)
+    return cfg
+
+
+def reg_domain(host):
+    """The name a site is known by: last two labels (three after co / com ... + a country code: example.co.jp)."""
+    parts = host.lower().rstrip(".").split(".")
+    if len(parts) >= 3 and len(parts[-1]) == 2 and parts[-2] in SECOND_LEVEL:
+        return ".".join(parts[-3:])
+    return ".".join(parts[-2:])
+
+
+def bulk_patterns():
+    p = state_path(BULK_FILE)
+    try:
+        st = os.stat(p)
+        key = (p, st.st_mtime_ns, st.st_size)
+    except OSError:
+        _bulk_cache.update(key=None, pats=())
+        return ()
+    if _bulk_cache["key"] != key:
+        pats = []
+        try:
+            with open(p, encoding="utf-8-sig") as f:
+                for line in f:
+                    t = line.split("#")[0].strip().lower().lstrip("*.")
+                    if t:
+                        pats.append(t)
+        except OSError:
+            pass
+        _bulk_cache.update(key=key, pats=tuple(pats))
+    return _bulk_cache["pats"]
+
+
+def load_learned():
+    """bulk-learned.json: {registered domain: last seen}. Entries older than 30 days are forgotten."""
+    _learned_loaded[0] = True
+    learned_bulk.clear()
+    try:
+        with open(state_path(LEARNED_FILE), encoding="utf-8") as f:
+            d = json.load(f)
+        now = time.time()
+        for k, v in d.items():
+            if isinstance(k, str) and isinstance(v, (int, float)) and now - v < LEARN_KEEP_SEC:
+                learned_bulk[k.lower()] = float(v)
+    except (OSError, ValueError, AttributeError):
+        pass
+
+
+def save_learned():
+    try:
+        with open(state_path(LEARNED_FILE), "w", encoding="utf-8") as f:
+            json.dump(learned_bulk, f)
+    except OSError:
+        pass
+
+
+def learn_bulk(host):
+    """A direct connection to this host moved a lot of data: it is worth bonding next time."""
+    if not host or is_ip(host) or "." not in host:
+        return
+    if not _learned_loaded[0]:
+        load_learned()
+    now = time.time()
+    for k in [k for k, v in learned_bulk.items() if now - v > LEARN_KEEP_SEC]:
+        learned_bulk.pop(k, None)
+    key = host.lower().rstrip(".")  # the exact host only: never a whole domain with its login pages
+    new = key not in learned_bulk
+    learned_bulk[key] = now
+    while len(learned_bulk) > LEARN_MAX:
+        learned_bulk.pop(min(learned_bulk, key=learned_bulk.get), None)
+    if new:
+        log("bond: learned a bulk host:", key)
+    save_learned()
+
+
+def named_bulk(host):
+    """A download/video host named in the built-in list or in bulk.local.txt."""
+    h = host.lower().rstrip(".")
+    return any(h == p or h.endswith("." + p) for p in BULK_BUILTIN + bulk_patterns())
+
+
+def is_bulk(host):
+    h = host.lower().rstrip(".")
+    if named_bulk(h):
+        return True
+    if not _learned_loaded[0]:
+        load_learned()
+    if is_ip(h):
+        return h in learned_bulk
+    key = h
+    if key in learned_bulk:
+        learned_bulk[key] = time.time()
+        return True
+    return False
+
+
+def load_cf():
+    global cf_nets
+    try:
+        with open(state_path(CF_FILE), encoding="utf-8") as f:
+            d = json.load(f)
+        nets = [ipaddress.ip_network(x) for x in d["v4"]]
+        if nets:
+            cf_nets = nets
+            cf_state["at"] = float(d.get("at", 0))
+            return cf_state["at"]
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return 0
+
+
+def in_cloudflare(ip):
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return any(a in n for n in (cf_nets or ()) if n.version == a.version)
+
+
+async def fetch_cf():
+    """Cloudflare's address list (a few hundred bytes) over any working link; kept in cf-ips.json."""
+    global cf_nets
+    for l in sorted((l for l in links.values() if l["healthy"] and not l["suspect"]), key=lambda l: l["rtt"] or 999):
+        try:
+            r, w = await asyncio.wait_for(connect_tls(l, "www.cloudflare.com"), 15)
+            try:
+                w.write(b"GET /ips-v4 HTTP/1.1\r\nHost: www.cloudflare.com\r\nConnection: close\r\n"
+                        b"User-Agent: link-bond\r\n\r\n")
+                raw = b""
+                while len(raw) < 65536:
+                    more = await asyncio.wait_for(r.read(65536), 15)
+                    if not more:
+                        break
+                    raw += more
+            finally:
+                w.close()
+            head, _, body = raw.partition(b"\r\n\r\n")
+            if b" 200 " not in head.split(b"\r\n")[0]:
+                continue
+            nets = []
+            for line in body.decode("ascii", "ignore").split():
+                try:
+                    nets.append(ipaddress.ip_network(line.strip()))
+                except ValueError:
+                    pass
+            if len(nets) >= 5:
+                cf_nets = nets
+                cf_state["at"] = time.time()
+                with open(state_path(CF_FILE), "w", encoding="utf-8") as f:
+                    json.dump({"at": time.time(), "v4": [str(n) for n in nets]}, f)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+async def cf_loop():
+    """Once a day (only when a relay is set up): refresh the Cloudflare ranges. Until they are known nothing is bonded."""
+    while True:
+        wait = 300
+        try:
+            if relay_cfg() is not None:
+                if cf_nets is None:
+                    load_cf()
+                if time.time() - cf_state["at"] > CF_REFRESH_SEC and not await fetch_cf():
+                    wait = 30  # a few hundred bytes: try again soon (at start the links may not be up yet)
+        except Exception:
+            pass
+        await asyncio.sleep(wait)
+
+
+def bond_links():
+    """The links a bonded connection may use right now."""
+    return [l for l in links.values() if l["healthy"] and not l["suspect"]]
+
+
+def bond_off_reason():
+    """Why bonding is not available at all right now (None = available)."""
+    if relay_cfg() is None:
+        return "no relay set up"
+    if relay_off_until > time.time():
+        return relay_why or "relay paused"
+    if vpn_on:
+        return "VPN on"
+    if len(bond_links()) < 2:
+        return "fewer than 2 links"
+    if cf_nets is None:
+        if time.time() - cf_state["tried"] > 5:  # (a file read at most every 5 s)
+            cf_state["tried"] = time.time()
+            load_cf()
+        if cf_nets is None:
+            return "Cloudflare ranges not known yet"
+    return None
+
+
+def bondable(host, port, ip):
+    """Should this connection go over all links through the relay? Only big transfers, and only to sites the
+    relay can reach (not behind Cloudflare itself)."""
+    if bond_off_reason() is not None:
+        return False
+    if not (1 <= port <= 65535) or port in NO_RELAY_PORTS:
+        return False
+    if is_blocked(host) or not ip or in_cloudflare(ip):
+        return False
+    if is_pinned(host) and not named_bulk(host):  # a login site keeps one address; named download hosts are no logins
+        return False
+    if host_bad.get(host.lower(), 0) > time.time():
+        return False
+    return is_bulk(host)
+
+
+# ----- frames -----
+def f_data(seq, payload):
+    return struct.pack(">BI", T_DATA, seq) + payload
+
+
+def f_ack(cum, entries):
+    return struct.pack(">BIB", T_ACK, cum, len(entries)) + b"".join(struct.pack(">BQ", n, v) for n, v in entries)
+
+
+def f_fin(total):
+    return struct.pack(">BI", T_FIN, total)
+
+
+def f_err(text):
+    return bytes([T_ERR]) + text.encode("utf-8", "replace")[:100]
+
+
+def f_ok():
+    return bytes([T_OK])
+
+
+def f_ping(ms):
+    return struct.pack(">BQ", T_PING, ms)
+
+
+def f_pong(ms):
+    return struct.pack(">BQ", T_PONG, ms)
+
+
+def decode_frame(msg):
+    """One WebSocket message -> (type, ...) or None if it is not a valid frame.
+    (T_DATA, seq, payload) (T_ACK, cum, {link: bytes}) (T_FIN, total) (T_ERR, text) (T_OK,) (T_PING, ms) (T_PONG, ms)"""
+    try:
+        t = msg[0]
+        if t == T_DATA and len(msg) > 5:
+            return T_DATA, struct.unpack_from(">I", msg, 1)[0], msg[5:]
+        if t == T_ACK:
+            cum, n = struct.unpack_from(">IB", msg, 1)
+            if len(msg) != 6 + 9 * n:
+                return None
+            return T_ACK, cum, {struct.unpack_from(">B", msg, 6 + 9 * i)[0]: struct.unpack_from(">Q", msg, 7 + 9 * i)[0]
+                                for i in range(n)}
+        if t == T_FIN and len(msg) == 5:
+            return T_FIN, struct.unpack_from(">I", msg, 1)[0]
+        if t == T_ERR:
+            return T_ERR, bytes(msg[1:]).decode("utf-8", "replace")
+        if t == T_OK:
+            return (T_OK,)
+        if t in (T_PING, T_PONG) and len(msg) == 9:
+            return t, struct.unpack_from(">Q", msg, 1)[0]
+    except (IndexError, struct.error):
+        pass
+    return None
+
+
+def relay_dst(host, port):
+    return base64.urlsafe_b64encode(f"{host}:{port}".encode()).decode().rstrip("=")
+
+
+def relay_sig(secret, flow, link, t, d):
+    return hmac.new(secret, f"{flow}|{link}|{t}|{d}".encode(), hashlib.sha256).hexdigest()
+
+
+def relay_path(cfg, flow, link, t, host, port):
+    """/f/<flow>?l=<link>&t=<unix s>&d=<destination>&s=<signature> (the part after the relay address)."""
+    d = relay_dst(host, port)
+    return f"{cfg['base']}/f/{flow}?l={link}&t={t}&d={d}&s={relay_sig(cfg['secret'], flow, link, t, d)}"
+
+
+# ----- the scheduler (same rule on both sides) -----
+def l_window(rate, rtt):
+    return min(max(rate * (rtt + 0.1) * 2, MIN_WIN), MAX_WIN)
+
+
+def l_eta(inflight, n, rate, rtt):
+    return (inflight + n) / rate + rtt / 2
+
+
+def l_chunk(rate):
+    return int(min(max(rate * 0.05, MIN_CHUNK), MAX_CHUNK))
+
+
+def pick_link(blinks, queued, fixed=0):
+    """The link a piece should go on: the one where it arrives first. Returns (link, n, room) or None.
+    room False = that link's window is full: WAIT for an ACK. A worse link is never used instead - that is what
+    keeps a slow, lossy link from dragging a fast one down. fixed = the piece exists already (n bytes)."""
+    best = None
+    for b in blinks:
+        n = fixed or min(l_chunk(b.rate), queued)
+        if n <= 0:
+            continue
+        e = l_eta(b.inflight, n, b.rate, b.rtt)
+        if best is None or e < best[0]:
+            best = (e, b, n)
+    if best is None:
+        return None
+    _, b, n = best
+    return b, n, b.inflight + n <= l_window(b.rate, b.rtt)
+
+
+class BLink:
+    """One link inside one flow: its WebSocket and what the scheduler knows about it."""
+
+    def __init__(self, n, link=None):
+        self.n, self.link, self.ws = n, link, None
+        self.state = "down"      # down | connecting | wait (socket up, no OK yet) | up | dead (silent) -> up again when heard
+        r = (link or {}).get("rtt")
+        self.rtt = (r / 1000.0) if r else 0.3
+        self.rate = RATE_INIT    # bytes/s, learned from what the peer confirms
+        self.used = False        # data has gone over it once (a link that comes back starts at half its old rate)
+        self.rtt_ok = False      # a real answer time was measured on the current socket
+        self.reset_counts()
+        self.last_heard = self.ping_at = self.opened = self.dead_at = 0.0
+        self.next_try = 0.0
+
+    def reset_counts(self):
+        """Counters belong to one WebSocket (the relay starts them at 0 for every new one)."""
+        self.sent = self.acked = self.rep = 0     # DATA bytes sent on it / confirmed by the peer / last confirmed total
+        self.rx = self.rx_rep = 0                 # DATA bytes received on it / the total we confirm to the peer
+        self.rt_t, self.rt_acked, self.rt_sent = 0.0, 0, 0
+        self.peak = 0                             # most bytes in flight since the last rate update
+
+    @property
+    def inflight(self):
+        return max(0, self.sent - self.acked)
+
+    @property
+    def live(self):
+        return self.state == "up"
+
+
+class Chunk:
+    __slots__ = ("seq", "data", "tried", "link", "end", "t")
+
+    def __init__(self, seq, data):
+        self.seq, self.data = seq, data
+        self.tried = set()   # link numbers it went on already
+        self.link = -1       # the link of its latest copy
+        self.end = 0         # that link's byte count after this copy: confirmed once the link's total reaches it
+        self.t = 0.0
+
+
+# ----- a minimal WebSocket client (RFC 6455) -----
+class WSError(Exception):
+    pass
+
+
+class WSHandshakeError(WSError):
+    def __init__(self, status):
+        WSError.__init__(self, "HTTP %s" % status)
+        self.status = status
+
+
+def ws_xor(data, key):
+    """Apply the 4-byte mask (the same operation masks and unmasks)."""
+    n = len(data)
+    if not n:
+        return b""
+    k = (key * (n // 4 + 1))[:n]
+    return (int.from_bytes(data, "big") ^ int.from_bytes(k, "big")).to_bytes(n, "big")
+
+
+def ws_frame(opcode, payload, mask=True, fin=True):
+    n = len(payload)
+    m = 0x80 if mask else 0
+    b0 = (0x80 if fin else 0) | opcode
+    if n < 126:
+        head = bytes([b0, m | n])
+    elif n < 65536:
+        head = bytes([b0, m | 126]) + struct.pack(">H", n)
+    else:
+        head = bytes([b0, m | 127]) + struct.pack(">Q", n)
+    if mask:
+        key = os.urandom(4)
+        return head + key + ws_xor(payload, key)
+    return head + payload
+
+
+class WS:
+    """One WebSocket. send() queues a message (control messages first), recv() returns the next binary message
+    (ping / pong / close are handled inside; text messages are ignored). None = closed."""
+
+    def __init__(self, r, w, mask=True):
+        self.r, self.w, self.mask = r, w, mask
+        self.ctl, self.dq = collections.deque(), collections.deque()
+        self.ev = asyncio.Event()
+        self.closing = self.closed = False
+        self.close_code = None
+        self.task = asyncio.ensure_future(self._wloop())
+
+    def send(self, payload, ctl=False, opcode=2):
+        if self.closing or self.closed:
+            return
+        (self.ctl if ctl else self.dq).append(ws_frame(opcode, payload, self.mask))
+        self.ev.set()
+
+    async def _wloop(self):
+        try:
+            while True:
+                while self.ctl or (self.dq and not self.closing):
+                    self.w.write(self.ctl.popleft() if self.ctl else self.dq.popleft())
+                    if self.w.transport.get_write_buffer_size() > WS_BUF:
+                        await self.w.drain()
+                if self.closing:
+                    break
+                self.ev.clear()
+                await self.ev.wait()
+            await asyncio.wait_for(self.w.drain(), 3)
+        except (Exception, asyncio.CancelledError):
+            pass
+        finally:
+            self.closed = True
+            try:
+                self.w.close()
+            except Exception:
+                pass
+
+    def close(self, code=1000):
+        """Say goodbye (what is queued as control messages still goes out), then close."""
+        if self.closing or self.closed:
+            return
+        self.ctl.append(ws_frame(8, struct.pack(">H", code), self.mask))
+        self.closing = True
+        self.dq.clear()
+        self.ev.set()
+
+    def abort(self):
+        self.closing = self.closed = True
+        self.dq.clear()
+        self.ctl.clear()
+        try:
+            self.w.transport.abort()
+        except Exception:
+            pass
+        self.ev.set()
+
+    async def recv(self):
+        frag, frag_op = None, 0
+        try:
+            while True:
+                b0, b1 = await self.r.readexactly(2)
+                fin, op, n = b0 & 0x80, b0 & 0x0F, b1 & 0x7F
+                if b0 & 0x70:
+                    raise WSError("reserved bits")
+                if n == 126:
+                    n = struct.unpack(">H", await self.r.readexactly(2))[0]
+                elif n == 127:
+                    n = struct.unpack(">Q", await self.r.readexactly(8))[0]
+                key = await self.r.readexactly(4) if b1 & 0x80 else None
+                if n > WS_MAX_MSG:
+                    raise WSError("message too big")
+                data = await self.r.readexactly(n) if n else b""
+                if key:
+                    data = ws_xor(data, key)
+                if op >= 8:  # control message
+                    if not fin or n > 125:
+                        raise WSError("bad control message")
+                    if op == 8:
+                        self.close_code = struct.unpack(">H", data[:2])[0] if n >= 2 else 1005
+                        self.close(self.close_code if self.close_code < 5000 else 1000)
+                        return None
+                    if op == 9:
+                        self.send(data, ctl=True, opcode=10)
+                    continue
+                if op == 0:
+                    if frag is None:
+                        raise WSError("unexpected continuation")
+                    frag.append(data)
+                    if sum(len(x) for x in frag) > WS_MAX_MSG:
+                        raise WSError("message too big")
+                    if not fin:
+                        continue
+                    data, op, frag = b"".join(frag), frag_op, None
+                else:
+                    if frag is not None:
+                        raise WSError("interrupted fragments")
+                    if not fin:
+                        frag, frag_op = [data], op
+                        continue
+                if op == 2:
+                    return data
+        except (asyncio.IncompleteReadError, ConnectionError, OSError):
+            return None
+
+
+async def ws_handshake(r, w, host_header, path):
+    """HTTP upgrade. Returns a WS or raises WSHandshakeError(status)."""
+    key = base64.b64encode(os.urandom(16)).decode()
+    w.write((f"GET {path} HTTP/1.1\r\nHost: {host_header}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+             f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\nUser-Agent: link-bond\r\n\r\n").encode())
+    head = await r.readuntil(b"\r\n\r\n")
+    lines = head.decode("latin-1").split("\r\n")
+    parts = lines[0].split(" ")
+    status = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+    if status != 101:
+        raise WSHandshakeError(status)
+    hdr = {}
+    for ln in lines[1:]:
+        k, _, v = ln.partition(":")
+        hdr[k.strip().lower()] = v.strip()
+    want = base64.b64encode(hashlib.sha1(key.encode() + WS_GUID).digest()).decode()
+    if hdr.get("sec-websocket-accept") != want:
+        raise WSHandshakeError(0)
+    return WS(r, w)
+
+
+_ssl_ctx = []
+
+
+async def open_ws(l, cfg, path):
+    """A WebSocket to the relay over link l (the same bound socket as any other connection of that link)."""
+    ip = await resolve(cfg["host"], cfg["port"])
+    sk = mk_sock(l)
+    try:
+        await link_connect(l, sk, (ip, cfg["port"]))
+        if cfg["tls"]:
+            if not _ssl_ctx:
+                _ssl_ctx.append(ssl.create_default_context())
+            r, w = await asyncio.open_connection(sock=sk, ssl=_ssl_ctx[0], server_hostname=cfg["host"])
+        else:
+            r, w = await asyncio.open_connection(sock=sk)
+    except BaseException:
+        sk.close()
+        raise
+    default = 443 if cfg["tls"] else 80
+    try:
+        return await ws_handshake(r, w, cfg["host"] + ("" if cfg["port"] == default else ":%d" % cfg["port"]), path)
+    except BaseException:
+        w.close()
+        raise
+
+
+# ----- one bonded connection -----
+class BondFail(Exception):
+    """kind: host (the relay could not reach the site) | relay (the relay refuses us) | net (relay not reachable)"""
+
+    def __init__(self, kind, why):
+        Exception.__init__(self, why)
+        self.kind, self.why = kind, why
+
+
+class BondWriter:
+    """What tunnel() / pipe() write the app's bytes to (looks like an asyncio StreamWriter)."""
+
+    def __init__(self, flow):
+        self.f = flow
+
+    def write(self, data):
+        self.f.app_write(data)
+
+    async def drain(self):
+        await self.f.app_drain()
+
+    def close(self):
+        self.f.app_close()
+
+    def is_closing(self):
+        return self.f.closing or self.f.dead
+
+    def get_extra_info(self, name, default=None):
+        return default
+
+    async def wait_closed(self):
+        return None
+
+
+class BondFlow:
+    def __init__(self, cfg, host, port):
+        self.cfg, self.host, self.port = cfg, host, port
+        self.flow = os.urandom(16).hex()
+        self.reader = asyncio.StreamReader(limit=1 << 20)
+        self.writer = BondWriter(self)
+        self.lk = {}              # link number -> BLink
+        self.nums = {}            # id(link dict) -> link number
+        self.dead = False         # finished (why = None) or aborted
+        self.why = None
+        self.tasks = set()
+        self.first_ok = asyncio.get_running_loop().create_future()
+        self.init_left = self.init_total = 0
+        self.http_fail = []
+        self.ws_seen = False
+        # upstream (app -> relay)
+        self.wbuf = bytearray()
+        self.closing = False      # the app closed its side: send FIN when everything is out
+        self.close_calls = 0
+        self.closed_at = 0.0
+        self.fin_sent = False
+        self.next_seq = 0
+        self.cum = 0              # every seq below this is confirmed by the relay
+        self.chunks = {}          # seq -> Chunk (kept until confirmed)
+        self.resend = collections.deque()
+        self.resend_set = set()
+        self.drain_ev = asyncio.Event()
+        self._kicked = False
+        # downstream (relay -> app)
+        self.cum_rx = 0           # next seq we need
+        self.rx_buf = {}
+        self.rx_buf_bytes = 0
+        self.fin_rx = None
+        self.eof = False
+        self.paused = False
+        self.ack_dirty = False
+        self.ack_bytes = 0
+        self.last_ack = 0.0
+        now = time.monotonic()
+        self.last_data = self.last_rx = now
+        self.no_live_since = now
+        self.t_rate = self.t_reinj = self.t_maint = now
+        bond_flows.add(self)
+
+    # ---- opening ----
+    def blink_for(self, l):
+        n = self.nums.get(id(l))
+        if n is None:
+            if len(self.lk) >= MAX_BOND_LINKS:
+                return None
+            n = len(self.lk)
+            self.nums[id(l)] = n
+            self.lk[n] = BLink(n, l)
+        return self.lk[n]
+
+    def spawn(self, coro):
+        t = asyncio.ensure_future(coro)
+        self.tasks.add(t)
+        t.add_done_callback(self.tasks.discard)
+        return t
+
+    async def start(self, timeout):
+        """Open a WebSocket on every link; return as soon as the relay says OK on one of them."""
+        self.spawn(self.ticker())
+        for l in bond_links()[:MAX_BOND_LINKS]:
+            b = self.blink_for(l)
+            if b is not None:
+                self.init_total += 1
+                self.init_left += 1
+                self.spawn(self.open_link(b, True))
+        if not self.init_total:
+            self.abort("no link", tell=False)
+            raise BondFail("net", "no link")
+        try:
+            await asyncio.wait_for(asyncio.shield(self.first_ok), timeout)
+        except asyncio.TimeoutError:
+            kind = "host" if self.ws_seen else "net"
+            self.abort("no OK in time", tell=False)
+            raise BondFail(kind, "no OK in time")
+        except BondFail:
+            self.abort("failed to start", tell=False)
+            raise
+
+    def fail_start(self, e):
+        if not self.first_ok.done():
+            self.first_ok.set_exception(e)
+        self.first_ok.exception()  # (marks it as seen: nobody may be waiting for it)
+
+    async def open_link(self, b, initial=False):
+        b.state = "connecting"
+        b.next_try = time.monotonic() + 3.0
+        path = relay_path(self.cfg, self.flow, b.n, int(time.time()), self.host, self.port)
+        ws, status = None, None
+        try:
+            ws = await asyncio.wait_for(open_ws(b.link, self.cfg, path), BOND_OPEN_SEC)
+        except WSHandshakeError as e:
+            status = e.status
+        except Exception:
+            pass
+        if initial:
+            self.init_left -= 1
+        if ws is None or self.dead:
+            if ws is not None:
+                ws.abort()
+            b.state = "down"
+            if initial and status is not None:
+                self.http_fail.append(status)
+            if initial and self.init_left <= 0 and not self.first_ok.done() \
+                    and not any(x.state in ("wait", "up") for x in self.lk.values()):
+                if len(self.http_fail) >= self.init_total:
+                    self.fail_start(BondFail("relay", "HTTP %s" % self.http_fail[0]))
+                else:
+                    self.fail_start(BondFail("net", "relay not reachable"))
+            return
+        self.ws_seen = True
+        old = b.rate
+        b.reset_counts()
+        b.rtt_ok = False
+        if b.used:
+            b.rate = max(RATE_FLOOR, old / 2)  # a link that comes back starts careful
+        b.ws, b.state = ws, "wait"
+        b.opened = b.last_heard = time.monotonic()
+        self.spawn(self.rx_loop(b, ws))
+
+    async def rx_loop(self, b, ws):
+        try:
+            while True:
+                msg = await ws.recv()
+                if msg is None:
+                    break
+                self.on_msg(b, msg)
+        except Exception as e:
+            ws.abort()
+            if not isinstance(e, (WSError, ConnectionError, OSError)):
+                log("bond: internal error:", type(e).__name__)
+        finally:
+            self.ws_gone(b, ws)
+
+    # ---- sending: the scheduler ----
+    def kick(self):
+        if not self._kicked and not self.dead:
+            self._kicked = True
+            asyncio.get_running_loop().call_soon(self.pump)
+
+    def _acct(self, b, n, kind):
+        l = b.link
+        if l is not None:
+            l["bytes"] += n
+            l["b_" + kind] += n
+            if kind == "down":
+                l["data_at"] = time.time()
+
+    def send_chunk(self, b, c, now):
+        n = len(c.data)
+        b.ws.send(f_data(c.seq, c.data))
+        b.sent += n
+        b.used = True
+        c.link, c.end, c.t = b.n, b.sent, now
+        c.tried.add(b.n)
+        self.peak_up(b)
+        self._acct(b, n, "up")
+
+    @staticmethod
+    def peak_up(b):
+        if b.inflight > b.peak:
+            b.peak = b.inflight
+
+    def pump(self):
+        """Hand pieces to links while there is room. Stops (waits for an ACK) as soon as the best link is full."""
+        self._kicked = False
+        if self.dead:
+            return
+        now = time.monotonic()
+        live = [b for b in self.lk.values() if b.state == "up"]
+        if live:
+            total = sum(b.inflight for b in live)
+            for _ in range(4000):
+                c = None
+                while self.resend:
+                    s = self.resend[0]
+                    c = self.chunks.get(s)
+                    if c is None or s < self.cum:
+                        self.resend.popleft()
+                        self.resend_set.discard(s)
+                        c = None
+                        continue
+                    break
+                if c is not None:
+                    p = pick_link(live, 0, len(c.data))
+                elif self.wbuf:
+                    p = pick_link(live, len(self.wbuf))
+                else:
+                    break
+                if p is None or not p[2] or total + p[1] > BOND_TOTAL_CAP:
+                    break
+                b, n, _ = p
+                if c is not None:
+                    self.resend.popleft()
+                    self.resend_set.discard(c.seq)
+                else:
+                    c = Chunk(self.next_seq, bytes(self.wbuf[:n]))
+                    del self.wbuf[:n]
+                    self.chunks[c.seq] = c
+                    self.next_seq += 1
+                    bond_stats["bytes"] += n
+                self.send_chunk(b, c, now)
+                self.last_data = now
+                total += n
+            if self.closing and not self.fin_sent and not self.wbuf and not self.resend:
+                self.fin_sent = True
+                for b in live:
+                    b.ws.send(f_fin(self.next_seq), ctl=True)
+        if len(self.wbuf) <= BOND_DRAIN_HIGH:
+            self.drain_ev.set()
+        self.check_done()
+
+    def requeue(self, b):
+        """Everything that went out on this link and is not confirmed goes back to the front of the queue."""
+        seqs = []
+        for s in range(self.cum, self.next_seq):
+            c = self.chunks.get(s)
+            if c is not None and c.link == b.n and c.end > b.acked and s not in self.resend_set:
+                seqs.append(s)
+        b.acked = b.sent
+        if seqs:
+            merged = sorted(set(self.resend) | set(seqs))
+            self.resend = collections.deque(merged)
+            self.resend_set = set(merged)
+
+    def link_dead(self, b, now):
+        b.state, b.dead_at = "dead", now
+        self.requeue(b)
+        self.ack_dirty = True  # the last ACK may have gone into the silent link: say it again on another
+        self.kick()
+
+    def reinject(self, now):
+        """A piece that stays unconfirmed too long (among the 8 lowest) is sent again on the best OTHER link."""
+        live = [b for b in self.lk.values() if b.state == "up"]
+        if len(live) < 2:
+            return
+        for s in range(self.cum, min(self.next_seq, self.cum + 8)):
+            c = self.chunks.get(s)
+            if c is None or s in self.resend_set:
+                continue
+            cur = self.lk.get(c.link)
+            if cur is None or cur.state != "up" or c.end <= cur.acked:
+                continue  # its link has it already (an earlier hole holds the line) or the link is gone
+            if now - c.t <= cur.rtt * 2 + cur.inflight / cur.rate + 0.5:
+                continue
+            p = pick_link([b for b in live if b.n not in c.tried], 0, len(c.data))
+            if p is not None and p[2]:
+                self.send_chunk(p[0], c, now)
+
+    # ---- receiving ----
+    def on_msg(self, b, msg):
+        now = time.monotonic()
+        b.last_heard = now
+        if b.state == "dead":
+            b.state = "up"
+            b.rate = max(RATE_FLOOR, b.rate / 2)
+            self.kick()
+        fr = decode_frame(msg)
+        if fr is None:
+            return
+        t = fr[0]
+        if t == T_DATA:
+            self.on_data(b, fr[1], fr[2], now)
+        elif t == T_ACK:
+            self.on_ack(fr[1], fr[2])
+        elif t == T_OK:
+            if b.state == "wait":
+                b.state = "up"
+                self.ping(b, now)
+                if self.fin_sent:
+                    b.ws.send(f_fin(self.next_seq), ctl=True)
+                if not self.first_ok.done():
+                    self.first_ok.set_result(True)
+                self.kick()
+        elif t == T_FIN:
+            self.fin_rx = fr[1]
+            self.deliver()
+            self.send_ack(now)
+        elif t == T_ERR:
+            if not self.first_ok.done():
+                self.fail_start(BondFail("host", fr[1]))
+            self.abort("relay: " + fr[1], tell=False)
+        elif t == T_PING:
+            b.ws.send(f_pong(fr[1]), ctl=True)
+        elif t == T_PONG:
+            s = max(0.001, (int(now * 1000) - fr[1]) / 1000.0)
+            b.rtt = b.rtt + (s - b.rtt) / 8 if b.rtt_ok else s  # the first real answer replaces the guess
+            b.rtt_ok = True
+
+    def on_data(self, b, seq, payload, now):
+        n = len(payload)
+        b.rx += n
+        self._acct(b, n, "down")
+        if not self.paused:
+            b.rx_rep = b.rx
+        self.last_rx = now
+        self.ack_dirty = True
+        self.ack_bytes += n
+        if seq >= self.cum_rx and seq not in self.rx_buf and not self.eof:
+            self.rx_buf[seq] = payload
+            self.rx_buf_bytes += n
+            if self.rx_buf_bytes > BOND_REORDER_MAX:
+                self.abort("reorder overflow")
+                return
+            self.deliver()
+        if self.ack_bytes >= (256 << 10):
+            self.send_ack(now)
+
+    def deliver(self):
+        """Give the app what is complete and in order."""
+        if self.eof:
+            return
+        buf = self.rx_buf
+        while not self.paused and self.cum_rx in buf:
+            d = buf.pop(self.cum_rx)
+            self.rx_buf_bytes -= len(d)
+            self.cum_rx += 1
+            bond_stats["bytes"] += len(d)
+            self.reader.feed_data(d)
+            if len(getattr(self.reader, "_buffer", b"")) > BOND_PAUSE_HIGH:
+                self.paused = True
+        if self.fin_rx is not None and self.cum_rx >= self.fin_rx and not self.eof:
+            self.eof = True
+            self.reader.feed_eof()
+            self.ack_dirty = True
+            self.send_ack(time.monotonic())
+            self.check_done()
+
+    def best_ctl(self):
+        c = [b for b in self.lk.values() if b.state == "up"] or [b for b in self.lk.values() if b.state == "dead"]
+        return min(c, key=lambda b: b.rtt) if c else None
+
+    def send_ack(self, now):
+        b = self.best_ctl()
+        self.ack_bytes = 0
+        if b is None or b.ws is None:
+            return
+        self.ack_dirty = False
+        self.last_ack = now
+        b.ws.send(f_ack(self.cum_rx, [(x.n, x.rx_rep) for x in self.lk.values() if x.rx_rep]), ctl=True)
+
+    def on_ack(self, cum, totals):
+        cum = min(cum, self.next_seq)
+        if cum > self.cum:
+            for s in range(self.cum, cum):
+                self.chunks.pop(s, None)
+            self.cum = cum
+        for n, total in totals.items():
+            x = self.lk.get(n)
+            if x is None:
+                continue
+            d = total - x.rep if total >= x.rep else total
+            x.rep = total
+            if d > 0:
+                x.acked = min(x.sent, x.acked + d)
+        self.kick()
+
+    def ping(self, b, now):
+        b.ping_at = now
+        b.ws.send(f_ping(int(now * 1000)), ctl=True)
+
+    # ---- links coming and going ----
+    def ws_gone(self, b, ws):
+        if b.ws is not ws:
+            return
+        if ws.close_code == 1011 and not self.dead:
+            self.abort("relay closed the flow", tell=False)
+            return
+        b.ws = None
+        b.state = "down"
+        self.requeue(b)
+        self.kick()
+
+    def drop_ws(self, b):
+        ws = b.ws
+        if ws is not None:
+            ws.abort()
+            self.ws_gone(b, ws)
+
+    def maintain(self, now):
+        """Every 3 s: a link that was cut loses its socket; a link that is healthy and has none gets one."""
+        present = {id(l) for l in links.values()}
+        for b in list(self.lk.values()):
+            l = b.link
+            if b.ws is not None and (id(l) not in present or not l["healthy"]):
+                self.drop_ws(b)
+        for l in bond_links():
+            b = self.blink_for(l)
+            if b is not None and b.state == "down" and now >= b.next_try:
+                self.spawn(self.open_link(b))
+
+    # ---- the app side ----
+    def app_write(self, data):
+        if self.closing or self.dead or not data:
+            return
+        self.wbuf += data
+        self.kick()
+
+    async def app_drain(self):
+        while len(self.wbuf) > BOND_DRAIN_HIGH and not self.dead:
+            self.drain_ev.clear()
+            await self.drain_ev.wait()
+        if self.dead and self.why:
+            raise ConnectionError(self.why)
+
+    def app_close(self):
+        self.close_calls += 1
+        if self.dead:
+            return
+        if self.close_calls == 1:
+            self.closing = True
+            self.closed_at = time.monotonic()
+            self.kick()
+        elif not self.eof:
+            self.abort("app closed")  # the app is gone before the answer was complete
+
+    # ---- housekeeping ----
+    async def ticker(self):
+        while not self.dead:
+            await asyncio.sleep(0.02)
+            try:
+                self.tick(time.monotonic())
+            except Exception as e:
+                log("bond: internal error:", type(e).__name__)
+                self.abort("internal error")
+
+    def tick(self, now):
+        if self.paused and len(getattr(self.reader, "_buffer", b"")) < BOND_PAUSE_LOW:
+            self.paused = False
+            for b in self.lk.values():
+                b.rx_rep = b.rx
+            self.ack_dirty = True
+            self.deliver()
+        n_live = 0
+        for b in self.lk.values():
+            if b.state == "up" and now - b.last_heard > max(2.0, 4 * b.rtt):
+                self.link_dead(b, now)
+            elif b.state == "dead" and now - b.dead_at > 10:
+                self.drop_ws(b)
+            elif b.state == "wait" and now - b.opened > 8:
+                self.drop_ws(b)
+            if b.state == "up":
+                n_live += 1
+            if b.state in ("up", "dead") and now - b.ping_at >= 1.0:
+                self.ping(b, now)
+        if n_live:
+            self.no_live_since = now
+        elif now - self.no_live_since > 60:
+            self.abort("no link for 60 s")
+            return
+        if (self.ack_dirty and now - self.last_ack >= 0.04) or (now - self.last_rx < 10 and now - self.last_ack >= 1.0):
+            self.send_ack(now)  # (and once a second while data comes: an ACK lost with a link is repeated)
+        if now - self.t_rate >= 0.25:
+            self.t_rate = now
+            for b in self.lk.values():
+                if b.state in ("up", "dead"):
+                    self.rate_window(b, now)
+        if now - self.t_reinj >= 0.1:
+            self.t_reinj = now
+            self.reinject(now)
+        if now - self.t_maint >= 1.0:
+            self.t_maint = now
+            self.maintain(now)
+            if now - max(self.last_data, self.last_rx) > BOND_IDLE_SEC:
+                self.abort("idle")
+                return
+            if self.closing and not self.eof and now - max(self.closed_at, self.last_rx) > 20:
+                self.abort("app went away")
+                return
+        self.pump()
+
+    def rate_window(self, b, now):
+        """Every 250 ms: how fast the peer confirms bytes on this link. Only a window where the link was really
+        full (in flight reached half the window) says something: a player that fetches in bursts, with idle
+        seconds between, must not make the next burst start slow. A faster sample counts at once; a slower one
+        only by 1/4."""
+        if b.rt_t:
+            dt = now - b.rt_t
+            sample = (b.acked - b.rt_acked) / dt
+            if b.sent > b.rt_sent and b.peak >= l_window(b.rate, b.rtt) / 2:
+                b.rate = max(RATE_FLOOR, sample if sample > b.rate else b.rate * 0.75 + sample * 0.25)
+        b.rt_t, b.rt_acked, b.rt_sent = now, b.acked, b.sent
+        b.peak = b.inflight
+
+    def check_done(self):
+        if self.dead or not (self.fin_sent and self.eof and self.cum >= self.next_seq):
+            return
+        self.send_ack(time.monotonic())
+        self.finish()
+
+    def finish(self):
+        self.dead = True
+        self.cleanup(1000)
+
+    def abort(self, why, tell=True):
+        if self.dead:
+            return
+        self.dead, self.why = True, why
+        if not self.eof:
+            self.reader.set_exception(ConnectionError(why))
+        if tell:
+            b = self.best_ctl()
+            if b is not None and b.ws is not None:
+                b.ws.send(f_err(why), ctl=True)
+        self.cleanup(1011)
+
+    def cleanup(self, code):
+        bond_flows.discard(self)
+        if sum(b.rx + b.sent for b in self.lk.values()) > 1 << 20:  # what each link carried (for tuning)
+            log("bond: flow done -", "; ".join(f"{label(b.link)} down {b.rx >> 10} KB up {b.sent >> 10} KB rtt {b.rtt * 1000:.0f} ms rate {b.rate * 8 / 1e6:.1f} Mbps" for b in self.lk.values()))
+        for b in self.lk.values():
+            if b.ws is not None:
+                b.ws.close(code)
+                b.ws = None
+            b.state = "down"
+        cur = asyncio.current_task()
+        for t in list(self.tasks):
+            if t is not cur:
+                t.cancel()
+        self.chunks.clear()
+        self.rx_buf.clear()
+        self.drain_ev.set()
+        if not self.first_ok.done():
+            self.first_ok.set_exception(BondFail("net", "closed"))
+            self.first_ok.exception()
+
+
+def bond_note_fail(host, e):
+    """What to remember after a bonded open failed: not bonding this host / pausing the relay for a while."""
+    global relay_off_until, relay_why
+    now = time.time()
+    if e.kind == "host":
+        host_bad[host.lower()] = now + BOND_HOST_BAD_SEC
+        log("bond: relay cannot reach", host, "- not bonded for 10 min")
+    elif e.kind == "relay":
+        relay_off_until, relay_why = now + BOND_RELAY_OFF_SEC, "relay refused (" + e.why + ")"
+        log("bond: relay off for 10 min (" + e.why + ")")
+    else:
+        relay_off_until, relay_why = now + BOND_NET_OFF_SEC, "relay not reachable"
+        log("bond: relay not reachable - paused for 1 min")
+
+
+async def open_bonded(host, port):
+    """One connection over all links through the relay. Returns (reader, writer) or raises."""
+    cfg = relay_cfg()
+    if cfg is None:
+        raise ConnectionError("no relay")
+    f = BondFlow(cfg, host, port)
+    try:
+        await f.start(BOND_OPEN_SEC)
+    except BondFail as e:
+        bond_note_fail(host, e)
+        raise ConnectionError("bond: " + e.kind)
+    return f.reader, f.writer
+
+
+def bond_status():
+    why = bond_off_reason()
+    return {"on": why is None, "flows": len(bond_flows), "bytes": bond_stats["bytes"], "why_off": why}
+
+
+def learn_from(rec, link, host):
+    """A direct tunnel that moved a lot: remember the host as bulk (the next connection to it is bonded)."""
+    if link is BOND_LINK or link is SYSTEM_LINK or not host or is_pinned(host):
+        return  # (a login site is never bonded, so learning it is useless)
+    if max(rec.get("n_up", 0), rec.get("n_down", 0)) >= LEARN_BYTES:
+        learn_bulk(host)
 
 
 # ---------- SOCKS5 / HTTP front ends ----------
@@ -2839,6 +4085,7 @@ def status_dict():
         "eco": {"on": eco_on, "rules": [{"host": r.pattern, "cap_mbps": r.mbps, "MB": round(r.bytes / 1e6, 1)} for r in eco_rules]},
         "blocked": {"on": block_on, "total": blocked_total, "top": blocked_hosts.most_common(8)},
         "links": out,
+        "bond": bond_status(),
         "problems": problems(),
         "total": {"now_down": total_down[-1] if total_down else 0.0, "now_up": total_up[-1] if total_up else 0.0,
                   "peak_down": max(total_down or [0]), "peak_up": max(total_up or [0]),
@@ -3427,6 +4674,7 @@ async def serve(port=1080, stats_port=1081, discover=True):
             asyncio.create_task(wifi_loop())
             asyncio.create_task(repair_loop())
         asyncio.create_task(release_loop())
+        asyncio.create_task(cf_loop())
     global link_back
     link_back = asyncio.Event()
     srv = await asyncio.start_server(handle, "127.0.0.1", port)

@@ -1308,8 +1308,510 @@ async def e2e():
         s.close()
 
 
+# ---------- one connection over all links (relay): checks that need no relay ----------
+class FakeWS:
+    """Stands in for a WebSocket: remembers what was sent."""
+
+    def __init__(self):
+        self.sent, self.closed, self.close_code = [], False, None
+
+    def send(self, payload, ctl=False, opcode=2):
+        self.sent.append((ctl, bytes(payload)))
+
+    def close(self, code=1000):
+        self.closed = True
+
+    def abort(self):
+        self.closed = True
+
+    def frames(self, kind=None):
+        out = [bond.decode_frame(m) for _, m in self.sent]
+        return [f for f in out if f and (kind is None or f[0] == kind)]
+
+
+def fake_flow(n=2, rtt_ms=40):
+    cfg = dict(host="127.0.0.1", port=1, tls=False, base="", secret=b"\x01" * 32)
+    f = bond.BondFlow(cfg, "example.test", 443)
+    bl = []
+    for i in range(n):
+        link = bond.new_link(1, "L%d" % i, "127.0.0.1")
+        link["rtt"] = rtt_ms
+        b = bond.BLink(i, link)
+        f.lk[i], f.nums[id(link)] = b, i
+        b.ws, b.state, b.last_heard = FakeWS(), "up", time.monotonic()
+        bl.append(b)
+    return f, bl
+
+
+async def ws_server_side(r, w, on_path):
+    """Tiny WebSocket server for the tests (handshake written out by hand, independent of bond.py)."""
+    import base64
+    import hashlib
+    head = (await r.readuntil(b"\r\n\r\n")).decode("latin-1").split("\r\n")
+    hdr = {k.strip().lower(): v.strip() for k, _, v in (x.partition(":") for x in head[1:] if x)}
+    on_path(head[0].split(" ")[1])
+    acc = base64.b64encode(hashlib.sha1(hdr["sec-websocket-key"].encode() + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest())
+    w.write(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + acc + b"\r\n\r\n")
+    await w.drain()
+    return bond.WS(r, w, mask=False)
+
+
+def bond_unit():
+    import hashlib
+    import hmac as hmac_
+    # frames
+    fr = bond.f_data(7, b"abc")
+    check("relay frames: DATA = type 1, u32 seq, payload", fr == b"\x01\x00\x00\x00\x07abc" and bond.decode_frame(fr) == (1, 7, b"abc"))
+    a = bond.f_ack(300, [(0, 5), (3, 2 ** 40)])
+    check("relay frames: ACK = u32 cum, u8 n, n x (u8 link, u64 bytes)",
+          a == b"\x02\x00\x00\x01\x2c\x02" + b"\x00" + (5).to_bytes(8, "big") + b"\x03" + (2 ** 40).to_bytes(8, "big")
+          and bond.decode_frame(a) == (2, 300, {0: 5, 3: 2 ** 40}))
+    check("relay frames: FIN / ERR / OK / PING / PONG",
+          bond.f_fin(9) == b"\x03\x00\x00\x00\x09" and bond.decode_frame(bond.f_fin(9)) == (3, 9)
+          and bond.decode_frame(bond.f_err("connect: refused")) == (4, "connect: refused")
+          and bond.decode_frame(bond.f_ok()) == (5,) and bond.f_ping(1)[:1] == b"\x06" and len(bond.f_ping(1)) == 9
+          and bond.decode_frame(bond.f_pong(123456789012)) == (7, 123456789012))
+    check("relay frames: garbage is refused, not crashed on",
+          bond.decode_frame(b"") is None and bond.decode_frame(b"\x09") is None and bond.decode_frame(b"\x02\x00\x00\x00\x01\x05") is None
+          and bond.decode_frame(b"\x01\x00\x00\x00\x01") is None and bond.decode_frame(b"\x06\x01") is None)
+    # signed address
+    secret = bytes(range(32))
+    cfg = dict(base="", secret=secret)
+    flow = "0123456789abcdef0123456789abcdef"
+    path = bond.relay_path(cfg, flow, 3, 1700000000, "video.example.com", 443)
+    d = "dmlkZW8uZXhhbXBsZS5jb206NDQz"
+    want = hmac_.new(secret, ("%s|3|1700000000|%s" % (flow, d)).encode(), hashlib.sha256).hexdigest()
+    check("relay address: /f/<flow>?l=&t=&d=<base64url host:port>&s=<hmac-sha256 hex>",
+          path == "/f/%s?l=3&t=1700000000&d=%s&s=%s" % (flow, d, want))
+    check("relay address: no '=' padding, url-safe alphabet", "=" not in bond.relay_dst("a", 1) and bond.relay_dst("??>", 1).replace("-", "").replace("_", "").isalnum())
+    # WebSocket frames (examples from RFC 6455 section 5.7)
+    rfc = bytes([0x37, 0xfa, 0x21, 0x3d, 0x7f, 0x9f, 0x4d, 0x51, 0x58])
+    check("websocket: masking (RFC 6455 example 'Hello')", bond.ws_xor(rfc[4:], rfc[:4]) == b"Hello" and bond.ws_xor(b"", b"abcd") == b"")
+    big = bytes(range(256)) * 256  # 64 KiB: the 8-byte length form
+    f64 = bond.ws_frame(2, big, mask=False)
+    check("websocket: lengths 125 / 126 / 65536 use the 1 / 2 / 8-byte forms",
+          bond.ws_frame(2, b"x" * 125, False)[:2] == b"\x82\x7d" and bond.ws_frame(2, b"x" * 126, False)[:4] == b"\x82\x7e\x00\x7e"
+          and f64[:10] == b"\x82\x7f" + (65536).to_bytes(8, "big") and len(f64) == 10 + 65536)
+    mk = bond.ws_frame(2, b"hi", mask=True)
+    check("websocket: a client frame is masked", mk[1] == 0x82 and mk[2:6] != b"" and bond.ws_xor(mk[6:], mk[2:6]) == b"hi")
+    # sizes and the rule
+    check("scheduler: window 64 KiB..16 MiB, chunk 4..64 KiB",
+          bond.l_window(1, 0.1) == 65536 and bond.l_window(1e9, 1) == 16 << 20 and abs(bond.l_window(1 << 20, 0.4) - (1 << 20)) < 1
+          and bond.l_chunk(1) == 4096 and bond.l_chunk(1e9) == 65536 and bond.l_chunk(256 * 1024) == 13107)
+    fast, slow = bond.BLink(0), bond.BLink(1)
+    fast.rate, fast.rtt, fast.state = 7.5e6, 0.04, "up"
+    slow.rate, slow.rtt, slow.state = 75e3, 1.7, "up"
+    p = bond.pick_link([slow, fast], 1 << 20)
+    check("scheduler: the fast link gets the piece while it has room", p[0] is fast and p[2])
+    fast.sent = int(bond.l_window(fast.rate, fast.rtt))  # its window is full
+    p = bond.pick_link([slow, fast], 1 << 20)
+    check("scheduler: window full -> WAIT for an ACK, the slow link gets nothing", p[0] is fast and not p[2])
+    fast.sent = 12_000_000  # a long queue: the slow link would deliver first now
+    p = bond.pick_link([slow, fast], 1 << 20)
+    check("scheduler: once the fast link's queue is long the slow link gets a piece", p[0] is slow and p[2])
+    fast.sent = 0
+    a_, b_ = bond.BLink(0), bond.BLink(1)
+    a_.state = b_.state = "up"
+    a_.sent = 50_000
+    check("scheduler: equal links - the emptier one wins", bond.pick_link([a_, b_], 100_000)[0] is b_ and bond.pick_link([], 5) is None)
+    # rate estimate: idle windows say nothing, a faster sample counts at once, a slower one by 1/4
+    b = bond.BLink(0)
+    fl = bond.BondFlow.__new__(bond.BondFlow)
+    b.rate, b.rt_t, b.rt_acked, b.rt_sent = 1e6, 10.0, 0, 100
+    fl.rate_window(b, 10.25)
+    check("rate: a window with nothing sent keeps the rate", b.rate == 1e6)
+    b.sent, b.acked, b.peak, b.rt_t, b.rt_acked, b.rt_sent = 700_000, 600_000, 800_000, 20.0, 0, 0
+    fl.rate_window(b, 20.25)
+    check("rate: a full window with a faster sample takes it at once (2.4 MB/s)", abs(b.rate - 2.4e6) < 1)
+    b.sent, b.acked, b.peak, b.rt_t, b.rt_acked, b.rt_sent = 900_000, 600_000 + 100_000, 3_000_000, 30.0, 600_000, 700_000
+    fl.rate_window(b, 30.25)
+    check("rate: a slower sample moves it by 1/4 only, never below 8 KiB/s", abs(b.rate - (2.4e6 * 0.75 + 0.4e6 * 0.25)) < 1)
+    b.sent, b.acked, b.peak, b.rt_t, b.rt_acked, b.rt_sent = 1, 1, 10 ** 9, 40.0, 1, 0
+    b.rate = 9000
+    fl.rate_window(b, 40.25)
+    check("rate: floor", b.rate == 8192)
+    # which hosts
+    check("registered domain: last two labels, three for co.jp / com.au",
+          bond.reg_domain("a.b.example.com") == "example.com" and bond.reg_domain("x.example.co.jp") == "example.co.jp"
+          and bond.reg_domain("foo.com.au") == "foo.com.au" and bond.reg_domain("example.com.") == "example.com")
+
+
+def bond_hosts():
+    """bondable(): every rule on its own."""
+    import ipaddress
+    saved = (dict(bond.links), bond.cf_nets, bond.relay_off_until, dict(bond.host_bad), bond.vpn_on, list(bond.pinned_exact),
+             list(bond.pinned_sub))
+    d = bond.STATE_DIR
+    rf, bf, lf = (os.path.join(d, n) for n in (bond.RELAY_FILE, bond.BULK_FILE, bond.LEARNED_FILE))
+    for p in (rf, bf, lf):
+        if os.path.exists(p):
+            os.remove(p)
+    bond.learned_bulk.clear()
+    bond._learned_loaded[0] = True
+    bond.links.clear()
+    bond.pinned_exact[:], bond.pinned_sub[:] = ["bank.example"], []
+    for i in (1, 2):
+        bond.links[i] = bond.new_link(1, "ph%d" % i, "127.0.0.1")
+    bond.cf_nets = [ipaddress.ip_network("10.16.0.0/13")]
+    bond.relay_off_until, bond.vpn_on = 0.0, False
+    bond.host_bad.clear()
+    check("bondable: no relay.local.txt -> off, and it says why", not bond.bondable("r1.gvt1.com", 443, "8.8.8.8")
+          and bond.bond_off_reason() == "no relay set up" and bond.relay_cfg() is None)
+    with open(rf, "w", encoding="utf-8") as f:
+        f.write("ws://127.0.0.1:8787\n" + "ab" * 32 + "\n")
+    cfg = bond.relay_cfg()
+    check("relay.local.txt: address and secret are read", cfg and cfg["host"] == "127.0.0.1" and cfg["port"] == 8787 and not cfg["tls"]
+          and cfg["secret"] == bytes.fromhex("ab" * 32))
+    with open(rf, "w", encoding="utf-8") as f:
+        f.write("wss://relay.example.com/x\n" + "cd" * 32 + "\n")
+    cfg = bond.relay_cfg()
+    check("relay.local.txt: wss defaults to 443, the file is read again when it changes",
+          cfg and cfg["tls"] and cfg["port"] == 443 and cfg["base"] == "/x")
+    with open(rf, "w", encoding="utf-8") as f:
+        f.write("http://nope\nzz\n")
+    check("relay.local.txt: a broken file means off", bond.relay_cfg() is None)
+    with open(rf, "w", encoding="utf-8") as f:
+        f.write("ws://127.0.0.1:8787\n" + "ab" * 32 + "\n")
+    ok = bond.bondable("r1.gvt1.com", 443, "8.8.8.8")
+    check("bondable: a built-in bulk host with two links", ok and bond.bond_status()["on"] and bond.bond_status()["why_off"] is None)
+    check("bondable: a host that is not bulk is not", not bond.bondable("example.com", 443, "8.8.8.8"))
+    check("bondable: an address behind Cloudflare is not", not bond.bondable("r1.gvt1.com", 443, "10.16.1.1"))
+    check("bondable: mail ports are not", not bond.bondable("r1.gvt1.com", 25, "8.8.8.8") and not bond.bondable("r1.gvt1.com", 587, "8.8.8.8"))
+    bond.pinned_exact[:] = ["gvt1.com"]
+    check("bondable: a named download host is bonded even under a pinned domain (it has no login)",
+          bond.bondable("r1.gvt1.com", 443, "8.8.8.8"))
+    bond.learned_bulk["files.pinme.example"] = time.time()
+    bond.pinned_exact[:] = ["pinme.example"]
+    check("bondable: a pinned host (stays on one IP) that was only learned is not",
+          not bond.bondable("files.pinme.example", 443, "8.8.8.8"))
+    bond.learned_bulk.pop("files.pinme.example", None)
+    bond.pinned_exact[:] = []
+    del bond.links[2]
+    check("bondable: one link only -> off (nothing to bond)", not bond.bondable("r1.gvt1.com", 443, "8.8.8.8")
+          and bond.bond_off_reason() == "fewer than 2 links")
+    bond.links[2] = bond.new_link(1, "ph2", "127.0.0.1")
+    bond.links[2]["suspect"] = True
+    check("bondable: a suspect link does not count", not bond.bondable("r1.gvt1.com", 443, "8.8.8.8"))
+    bond.links[2]["suspect"] = False
+    bond.cf_nets = None
+    check("bondable: Cloudflare ranges not known yet -> off", not bond.bondable("r1.gvt1.com", 443, "8.8.8.8")
+          and bond.bond_off_reason() == "Cloudflare ranges not known yet")
+    with open(os.path.join(d, bond.CF_FILE), "w", encoding="utf-8") as f:
+        json.dump({"at": time.time(), "v4": ["10.16.0.0/13", "1.2.3.4/32"]}, f)
+    bond.cf_state["tried"] = 0.0
+    check("bondable: the ranges come from cf-ips.json", bond.bondable("r1.gvt1.com", 443, "8.8.8.8")
+          and not bond.bondable("r1.gvt1.com", 443, "1.2.3.4"))
+    bond.host_bad["r1.gvt1.com"] = time.time() + 100
+    check("bondable: a host the relay could not reach is skipped for a while", not bond.bondable("r1.gvt1.com", 443, "8.8.8.8"))
+    bond.host_bad["r1.gvt1.com"] = time.time() - 1
+    bond.relay_off_until, bond.relay_why = time.time() + 100, "relay refused (HTTP 403)"
+    check("bondable: the relay refusing us pauses everything", not bond.bondable("r1.gvt1.com", 443, "8.8.8.8")
+          and bond.bond_status()["why_off"] == "relay refused (HTTP 403)")
+    bond.relay_off_until = 0.0
+    bond.vpn_on = True
+    check("bondable: VPN on -> off", not bond.bondable("r1.gvt1.com", 443, "8.8.8.8"))
+    bond.vpn_on = False
+    # bulk.local.txt and learning
+    with open(bf, "w", encoding="utf-8") as f:
+        f.write("# mine\ncdn.mysite.example  # comment\n*.big.example\n")
+    check("bulk.local.txt: your own hosts (suffix match, comments, *.)", bond.bondable("a.cdn.mysite.example", 443, "8.8.8.8")
+          and bond.bondable("big.example", 443, "8.8.8.8") and not bond.bondable("mysite.example", 443, "8.8.8.8"))
+    rec = {"n_up": 100, "n_down": bond.LEARN_BYTES - 1}
+    bond.learn_from(rec, bond.links[1], "files.learnme.co.jp")
+    check("learning: below 8 MB nothing is learned", not bond.bondable("x.learnme.co.jp", 443, "8.8.8.8"))
+    rec["n_down"] = bond.LEARN_BYTES
+    bond.learn_from(rec, bond.BOND_LINK, "files.learnme.co.jp")
+    bond.learn_from(rec, bond.SYSTEM_LINK, "files.learnme.co.jp")
+    bond.learn_from(rec, bond.links[1], "10.1.2.3")
+    check("learning: a bonded tunnel, the system route and an IP address do not teach anything", not bond.learned_bulk)
+    bond.learn_from(rec, bond.links[1], "files.learnme.co.jp")
+    saved_file = json.load(open(lf, encoding="utf-8"))
+    check("learning: 8 MB in one direction -> that exact host is bulk and kept in bulk-learned.json",
+          bond.bondable("files.learnme.co.jp", 443, "8.8.8.8") and "files.learnme.co.jp" in saved_file)
+    check("learning: other hosts of the same domain (login pages ...) are not", not bond.bondable("other.learnme.co.jp", 443, "8.8.8.8"))
+    bond.learned_bulk["files.learnme.co.jp"] = time.time() - bond.LEARN_KEEP_SEC - 5
+    bond.save_learned()
+    bond.load_learned()
+    check("learning: forgotten after 30 days", "files.learnme.co.jp" not in bond.learned_bulk)
+    for i in range(bond.LEARN_MAX + 20):
+        bond.learn_bulk("h%d.site%d.example" % (i, i))
+    check("learning: at most 500 hosts", len(bond.learned_bulk) <= bond.LEARN_MAX)
+    for p in (rf, bf, lf, os.path.join(d, bond.CF_FILE)):
+        if os.path.exists(p):
+            os.remove(p)
+    bond.learned_bulk.clear()
+    bond.links.clear()
+    bond.links.update(saved[0])
+    bond.cf_nets, bond.relay_off_until, bond.vpn_on = saved[1], saved[2], saved[4]
+    bond.host_bad.clear()
+    bond.host_bad.update(saved[3])
+    bond.pinned_exact[:], bond.pinned_sub[:] = saved[5], saved[6]
+
+
+async def bond_flow_logic():
+    """The flow without any relay: pieces handed to fake sockets, answers fed in by hand."""
+    now = time.monotonic()
+    # upstream: split over two equal links, kept until confirmed
+    f, (b0, b1) = fake_flow()
+    b0.rate = b1.rate = 256 << 10  # small windows, so 50 KB must use both links
+    data = bytes(range(256)) * 200  # 51200 bytes
+    f.app_write(data)
+    f.pump()
+    got = {}
+    for b in (b0, b1):
+        for fr in b.ws.frames(bond.T_DATA):
+            got[fr[1]] = fr[2]
+    check("flow up: everything written is sent over the two links with consecutive numbers",
+          sorted(got) == list(range(len(got))) and b"".join(got[s] for s in sorted(got)) == data
+          and b0.ws.frames(bond.T_DATA) and b1.ws.frames(bond.T_DATA))
+    check("flow up: per-link bytes are counted (also on the link dict)",
+          b0.sent + b1.sent == len(data) and b0.link["b_up"] == b0.sent and b1.link["bytes"] == b1.sent)
+    seqs = sorted(got)
+    f.on_ack(len(seqs) // 2, {0: b0.sent // 2, 1: b1.sent // 2})
+    check("flow up: an ACK frees the confirmed pieces and the link's bytes",
+          f.cum == len(seqs) // 2 and len(f.chunks) == len(seqs) - len(seqs) // 2 and b0.inflight == b0.sent - b0.sent // 2)
+    # a link goes silent: its unconfirmed pieces go to the other one
+    f, (b0, b1) = fake_flow()
+    b0.rate = b1.rate = 256 << 10
+    f.app_write(data[:30000])
+    f.pump()
+    on1 = [fr[1] for fr in b1.ws.frames(bond.T_DATA)]
+    n0 = len(b0.ws.frames(bond.T_DATA))
+    f.link_dead(b1, now)
+    f.pump()
+    again = [fr[1] for fr in b0.ws.frames(bond.T_DATA)][n0:]
+    check("flow up: pieces on a silent link are sent again on the live one (nothing is lost)",
+          on1 and sorted(again) == sorted(on1) and b1.state == "dead")
+    f.on_msg(b1, bond.f_pong(int(time.monotonic() * 1000)))
+    check("flow up: a silent link that is heard again is live again", b1.state == "up")
+    # downstream: out of order, duplicate, FIN
+    f, (b0, b1) = fake_flow(rtt_ms=40)
+    b1.rtt = 0.02
+    f.on_msg(b0, bond.f_data(1, b"BB"))
+    f.on_msg(b1, bond.f_data(0, b"AA"))
+    f.on_msg(b0, bond.f_data(0, b"AA"))  # a duplicate
+    got = await asyncio.wait_for(f.reader.read(10), 2)
+    check("flow down: pieces from two links come out in order, a duplicate is dropped", got == b"AABB" and f.cum_rx == 2)
+    check("flow down: bytes are counted per link, duplicates included", b0.rx == 4 and b1.rx == 2 and b0.link["b_down"] == 4)
+    f.send_ack(time.monotonic())
+    ack = (b1.ws.frames(bond.T_ACK) or [None])[-1]
+    check("flow down: the ACK goes out on the link with the shortest answer time and carries cum + per-link totals",
+          ack == (bond.T_ACK, 2, {0: 4, 1: 2}) and not b0.ws.frames(bond.T_ACK))
+    f.on_msg(b0, bond.f_fin(3))
+    check("flow down: FIN before the last piece waits for it", not f.eof)
+    f.on_msg(b1, bond.f_data(2, b"C"))
+    got = await asyncio.wait_for(f.reader.read(10), 2)
+    tail = await asyncio.wait_for(f.reader.read(10), 2)
+    check("flow down: FIN + all pieces -> end of stream", got == b"C" and tail == b"" and f.eof)
+    # the app side
+    f, (b0, b1) = fake_flow()
+    w = f.writer
+    w.write(b"x" * 10)
+    w.close()
+    w.close()
+    check("flow: the second close() with the answer unfinished means the app is gone -> flow ends",
+          f.dead and w.is_closing() and w.get_extra_info("peername") is None)
+    try:
+        await f.reader.read(1)
+        failed_ok = False
+    except ConnectionError:
+        failed_ok = True
+    check("flow: ...and the app's read fails (not a clean end)", failed_ok)
+    f, (b0, b1) = fake_flow()
+    f.writer.write(b"hello")
+    f.writer.close()
+    f.pump()
+    fins = [fr for fr in b0.ws.frames(bond.T_FIN) + b1.ws.frames(bond.T_FIN)]
+    check("flow: close() sends FIN(total) on the live links once the data is out", fins and all(x == (bond.T_FIN, 1) for x in fins))
+    f.on_msg(b0, bond.f_err("connect: refused"))
+    check("flow: ERR from the relay ends the flow", f.dead)
+    f, (b0, b1) = fake_flow()
+    f.on_data(b0, 0, b"x" * 10, now)
+    f.rx_buf_bytes = bond.BOND_REORDER_MAX
+    f.on_data(b0, 5, b"y", now)
+    check("flow down: more than 32 MiB out of order ends the flow", f.dead and f.why == "reorder overflow")
+    bond.bond_flows.clear()
+
+
+async def bond_ws_and_fallback():
+    # the WebSocket client against a server written here
+    got_paths = []
+    srv_msgs = []
+
+    async def handler(r, w):
+        ws = await ws_server_side(r, w, got_paths.append)
+        w.write(bond.ws_frame(9, b"hi", mask=False))  # a ping from the server
+        w.write(bond.ws_frame(2, b"AAA", mask=False, fin=False) + bond.ws_frame(10, b"", mask=False)  # a pong in the middle
+                + bond.ws_frame(0, b"BBB", mask=False, fin=True))  # ...of a fragmented message
+        w.write(bond.ws_frame(1, b"text is ignored", mask=False))
+        while True:
+            m = await ws.recv()
+            if m is None:
+                break
+            srv_msgs.append(len(m))
+            ws.send(m)  # echo
+        w.close()
+
+    srv = await asyncio.start_server(handler, "127.0.0.1", 0)
+    port = srv.sockets[0].getsockname()[1]
+    r, w = await asyncio.open_connection("127.0.0.1", port)
+    ws = await bond.ws_handshake(r, w, "127.0.0.1:%d" % port, "/f/abc?x=1")
+    m1 = await asyncio.wait_for(ws.recv(), 2)
+    check("websocket: a fragmented message with a pong in the middle arrives whole (text and ping are skipped)", m1 == b"AAABBB")
+    big = os.urandom(70000)
+    ws.send(big)
+    ws.send(b"")
+    ws.send(b"x" * 300)
+    e1, e2, e3 = [await asyncio.wait_for(ws.recv(), 5) for _ in range(3)]
+    check("websocket: masked client frames of 70000 / 0 / 300 bytes are echoed back intact", e1 == big and e2 == b"" and e3 == b"x" * 300
+          and srv_msgs == [70000, 0, 300])
+    check("websocket: the handshake sent the path", got_paths == ["/f/abc?x=1"])
+    ws.close(1000)
+    end = await asyncio.wait_for(ws.recv(), 5)
+    check("websocket: close ends recv() with None", end is None)
+    srv.close()
+    # a server that answers 403
+    async def deny(r, w):
+        await r.readuntil(b"\r\n\r\n")
+        w.write(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+        await w.drain()
+        w.close()
+    srv = await asyncio.start_server(deny, "127.0.0.1", 0)
+    r, w = await asyncio.open_connection("127.0.0.1", srv.sockets[0].getsockname()[1])
+    try:
+        await bond.ws_handshake(r, w, "x", "/")
+        st = None
+    except bond.WSHandshakeError as e:
+        st = e.status
+    check("websocket: HTTP 403 instead of 101 is reported with its code", st == 403)
+    srv.close()
+
+    # open_via with and without a relay
+    import ipaddress
+    saved = (dict(bond.links), bond.cf_nets, bond.relay_off_until, bond.relay_why, bond.vpn_on)
+    d = bond.STATE_DIR
+    rf, bf = os.path.join(d, bond.RELAY_FILE), os.path.join(d, bond.BULK_FILE)
+    eport = free_port()
+    e = await asyncio.start_server(echo, "127.0.0.1", eport)
+    bond.links.clear()
+    for i in (1, 2):
+        l = bond.new_link(1, "ph%d" % i, "127.0.0.1")
+        l["rtt"] = 20
+        bond.links[i] = l
+    # the numbers in links must be real interface numbers for best_if(): the loopback is 1, both fake links use it
+    bond.links[1]["idx"] = bond.links[2]["idx"] = 1
+    bond.cf_nets = [ipaddress.ip_network("10.16.0.0/13")]
+    bond.relay_off_until, bond.vpn_on = 0.0, False
+    with open(bf, "w", encoding="utf-8") as f:
+        f.write("127.0.0.1\n")
+    if os.path.exists(rf):
+        os.remove(rf)
+
+    async def via_echo(payload):
+        l, r, w = await bond.open_via("127.0.0.1", eport)
+        w.write(payload)
+        await w.drain()
+        got = await asyncio.wait_for(r.readexactly(len(payload)), 5)
+        w.close()
+        return l, got
+
+    l, got = await via_echo(b"direct")
+    check("fallback: relay.local.txt missing -> the normal path, nothing changes", l is not bond.BOND_LINK and got == b"direct")
+    with open(rf, "w", encoding="utf-8") as f:
+        f.write("ws://127.0.0.1:%d\n" % free_port() + "ab" * 32 + "\n")  # nothing listens there
+    t0 = time.time()
+    l, got = await via_echo(b"fallback")
+    took = time.time() - t0
+    check("fallback: relay unreachable -> the normal path at once (no 6 s wait; took %.1f s)" % took, l is not bond.BOND_LINK and got == b"fallback" and took < 5)
+    check("fallback: ...and the relay is left alone for a minute (every later connection is direct at once)",
+          bond.relay_off_until > time.time() and bond.bond_status()["why_off"] == "relay not reachable")
+    t0 = time.time()
+    l, got = await via_echo(b"again")
+    check("fallback: the next one does not try the relay", l is not bond.BOND_LINK and got == b"again" and time.time() - t0 < 1)
+
+    # a small relay written here: signature checked, OK sent, DATA echoed
+    secret = bytes(range(32))
+    seen = []
+
+    async def fake_relay(r, w):
+        import hashlib
+        import hmac as hmac_
+        import urllib.parse
+        path = []
+        ws = await ws_server_side(r, w, path.append)
+        u = urllib.parse.urlsplit(path[0])
+        q = dict(urllib.parse.parse_qsl(u.query))
+        flow = u.path.rsplit("/", 1)[1]
+        sig = hmac_.new(secret, ("%s|%s|%s|%s" % (flow, q["l"], q["t"], q["d"])).encode(), hashlib.sha256).hexdigest()
+        seen.append((hmac_.compare_digest(sig, q["s"]), abs(time.time() - int(q["t"])) < 60, len(flow), q["l"]))
+        dst = base64_decode(q["d"])
+        seen.append(dst)
+        ws.send(bond.f_ok(), ctl=True)
+        down = up = got_b = 0
+        while True:
+            m = await ws.recv()
+            if m is None:
+                break
+            fr = bond.decode_frame(m)
+            if fr and fr[0] == bond.T_DATA:
+                ws.send(bond.f_data(down, fr[2]))
+                down += 1
+                up, got_b = max(up, fr[1] + 1), got_b + len(fr[2])
+                ws.send(bond.f_ack(up, [(int(q["l"]), got_b)]), ctl=True)
+            elif fr and fr[0] == bond.T_FIN:
+                ws.send(bond.f_fin(down), ctl=True)
+        w.close()
+
+    def base64_decode(s):
+        import base64
+        return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4)).decode()
+
+    rs = await asyncio.start_server(fake_relay, "127.0.0.1", 0)
+    rport = rs.sockets[0].getsockname()[1]
+    with open(rf, "w", encoding="utf-8") as f:
+        f.write("ws://127.0.0.1:%d\n" % rport + secret.hex() + "\n")
+    bond.relay_off_until = 0.0
+    b_before = bond.BOND_LINK["active"]
+    l, r, w = await bond.open_via("127.0.0.1", eport)
+    check("bonded open: open_via returns the 'bonded' pseudo link, the signature is right, the destination is host:port",
+          l is bond.BOND_LINK and l["name"] == "bonded" and bond.BOND_LINK["active"] == b_before + 1
+          and seen and seen[0][0] and seen[0][1] and seen[0][2] == 32 and seen[1] == "127.0.0.1:%d" % eport)
+    for _ in range(50):
+        if len(seen) >= 4:
+            break
+        await asyncio.sleep(0.02)
+    w.write(b"through the relay")
+    await w.drain()
+    got = await asyncio.wait_for(r.readexactly(17), 5)
+    w.close()
+    tail = await asyncio.wait_for(r.read(10), 5)
+    check("bonded open: bytes go out and come back through the relay protocol, FIN gives end of stream", got == b"through the relay" and tail == b"")
+    ups = sum(x["b_up"] for x in bond.links.values())
+    check("bonded open: the bytes are counted on the real links", ups >= 17 and sum(x["b_down"] for x in bond.links.values()) >= 17
+          and bond.bond_status()["flows"] in (0, 1) and bond.bond_status()["bytes"] >= 34)
+    link_n = len({s[3] for s in seen if isinstance(s, tuple)})
+    check("bonded open: one WebSocket per link (two links -> two link numbers)", link_n == 2)
+    await asyncio.sleep(0.3)
+    rs.close()
+    e.close()
+    for p in (rf, bf):
+        if os.path.exists(p):
+            os.remove(p)
+    bond.links.clear()
+    bond.links.update(saved[0])
+    bond.cf_nets, bond.relay_off_until, bond.relay_why, bond.vpn_on = saved[1], saved[2], saved[3], saved[4]
+
+
+async def bond_tests():
+    bond_unit()
+    bond_hosts()
+    await bond_flow_logic()
+    await bond_ws_and_fallback()
+
+
 if __name__ == "__main__":
     unit()
     asyncio.run(e2e())
+    asyncio.run(bond_tests())
     print("\nALL PASSED" if not failed else f"\n{len(failed)} FAILED: {failed}")
     sys.exit(1 if failed else 0)
